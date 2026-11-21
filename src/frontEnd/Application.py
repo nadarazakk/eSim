@@ -511,7 +511,10 @@ class Application(QtWidgets.QMainWindow):
         self.lefttoolbar.addAction(self.ngspice)
         # Share the openEMS action with the Tools menu.
         self.openems = self.lefttoolbar.addAction(
-            QtGui.QIcon(paths.image_path('openEMS.svg')), "Run openEMS…", self.run_openems)
+            QtGui.QIcon(paths.image_path('openEMS.svg')), "Run openEMS", self.run_openems)
+        self.openems.setShortcut("Ctrl+Alt+E")
+        self.openems.setToolTip(
+            "Run openEMS (Ctrl+Alt+E) - Run an openEMS XML model")
         self.openems.setIconVisibleInMenu(False)
         self.lefttoolbar.addSeparator()
         self.lefttoolbar.addWidget(_rail_caption("MODEL"))
