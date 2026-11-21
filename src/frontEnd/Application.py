@@ -509,6 +509,10 @@ class Application(QtWidgets.QMainWindow):
         self.lefttoolbar.addWidget(_rail_caption("SIMULATE"))
         self.lefttoolbar.addAction(self.conversion)
         self.lefttoolbar.addAction(self.ngspice)
+        # Share the openEMS action with the Tools menu.
+        self.openems = self.lefttoolbar.addAction(
+            QtGui.QIcon(paths.image_path('openEMS.svg')), "Run openEMS…", self.run_openems)
+        self.openems.setIconVisibleInMenu(False)
         self.lefttoolbar.addSeparator()
         self.lefttoolbar.addWidget(_rail_caption("MODEL"))
         self.lefttoolbar.addAction(self.model)
@@ -608,7 +612,7 @@ class Application(QtWidgets.QMainWindow):
         tools_menu.addAction(self.kicad)
         tools_menu.addAction(self.conversion)
         tools_menu.addAction(self.ngspice)
-        tools_menu.addAction("Run openEMS…", self.run_openems)
+        tools_menu.addAction(self.openems)
         tools_menu.addSeparator()
         tools_menu.addAction(self.model)
         tools_menu.addAction(self.subcircuit)
