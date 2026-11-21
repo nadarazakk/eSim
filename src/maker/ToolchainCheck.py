@@ -46,7 +46,8 @@ VERIFIER = 'verifier'       # Verilog Verifier (iverilog compile + vvp run)
 DCOSIM = 'dcosim'           # NgVeri d_cosim (Icarus) build + mixed-signal run
 NGVERI = 'ngveri'           # NgVeri legacy Verilator code-model build
 NGHDL = 'nghdl'             # NGHDL / GHDL VHDL co-simulation
-ALL_FLOWS = (SIMULATION, VERIFIER, DCOSIM, NGVERI, NGHDL)
+OPENEMS = 'openems'         # openEMS XML simulation (Ubuntu installer)
+ALL_FLOWS = (SIMULATION, VERIFIER, DCOSIM, NGVERI, NGHDL, OPENEMS)
 
 FLOW_LABELS = {
     SIMULATION: 'ngspice simulation',
@@ -54,6 +55,7 @@ FLOW_LABELS = {
     DCOSIM: 'NgVeri d_cosim (Icarus) co-simulation',
     NGVERI: 'NgVeri Verilator code-model build',
     NGHDL: 'NGHDL / GHDL VHDL co-simulation',
+    OPENEMS: 'openEMS XML simulation',
 }
 
 
@@ -376,6 +378,16 @@ def run_checks(flow=None):
     list of Check results. Purely filesystem/subprocess probing; no Qt."""
     checks = []
     checks.append(_check_ngspice())
+    if not _win():
+        solver = os.path.expanduser('~/.local/bin/openEMS')
+        if not os.path.isfile(solver):
+            solver = shutil.which('openEMS') or ''
+        version = _run_version([solver, '--help']) if solver else ''
+        checks.append(Check(
+            key='openems', label='openEMS XML solver', ok=bool(version),
+            path=solver or 'openEMS', detail=version,
+            hint='Re-run Ubuntu/install-eSim.sh --install to build openEMS.',
+            flows=(OPENEMS,)))
     checks.extend(_check_codemodels())
     checks.extend(_check_icarus())
     checks.extend(_check_build_tools())

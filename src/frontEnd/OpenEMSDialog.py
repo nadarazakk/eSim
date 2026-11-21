@@ -6,13 +6,27 @@ import xml.etree.ElementTree as ET
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 
+def find_openems():
+    # The installer and the Run button share one per-user solver path.
+    settings = QtCore.QSettings('eSim', 'eSim')
+    key = 'openEMS/executable'
+    saved = settings.value(key, '', type=str)
+    for candidate in (saved, '~/.local/bin/openEMS', 'openEMS', '~/openEMS-install/bin/openEMS'):
+        program = shutil.which(os.path.expanduser(candidate))
+        if program:
+            program = os.path.abspath(program)
+            if program != saved:
+                settings.setValue(key, program)
+            return program
+    return None
+
+
 class OpenEMSDialog(QtWidgets.QDialog):
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("Run openEMS")
         self.resize(640, 400)
         self.model = ""
-        self.settings = QtCore.QSettings('eSim', 'eSim')
         self.process = QtCore.QProcess(self)
         # Keep stdout and stderr together in the order Qt receives them.
         self.process.setProcessChannelMode(
@@ -67,16 +81,11 @@ class OpenEMSDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Simulation XML", str(error))
             return
 
-        key = 'openEMS/executable'
-        program = shutil.which(self.settings.value(key, '', type=str)) or shutil.which('openEMS')
+        program = find_openems()
         if not program:
-            program, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Locate openEMS executable")
-            if not program:
-                return
-            if not shutil.which(program):
-                QtWidgets.QMessageBox.warning(self, "openEMS", "Select an executable file.")
-                return
-            self.settings.setValue(key, program)
+            QtWidgets.QMessageBox.warning(
+                self, "openEMS", "Could not find the openEMS solver. Check the openEMS installation.")
+            return
 
         self.log.setPlainText("Running " + self.model + "\n")
         self.decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')

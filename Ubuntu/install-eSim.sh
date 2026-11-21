@@ -57,6 +57,7 @@ INSTALL_STEPS=(
     "installKicad:Installing KiCad"
     "copyKicadLibrary:Installing the eSim symbol library"
     "installNghdl:Building NGHDL and ngspice"
+    "installOpenEMS:Building and installing openEMS"
     "installSky130Pdk:Installing the SKY130 PDK"
     "installIhpPdk:Installing the IHP Open PDK"
     "createDesktopStartScript:Creating the launcher and desktop entry"
@@ -1072,6 +1073,53 @@ installSky130Pdk() {
     sudo chown -R "$USER:$USER" /usr/share/local/sky130_fd_pr
 }
 
+installOpenEMS() {
+    # Build the XML solver into a user-owned, revision-specific prefix. Keep
+    # incomplete builds off PATH and retain previous versions on failure.
+    local revision="12f2d08cc165d33561fb2242b178087197074e5c"
+    local prefix="$config_dir/openems/$revision"
+    local source_dir="$config_dir/openems-source/$revision"
+    local launcher="$HOME/.local/bin/openEMS"
+
+    sudo apt-get install -y build-essential git cmake \
+        libhdf5-dev libtinyxml-dev libboost-all-dev zlib1g-dev libvtk9-dev
+
+    if [ ! -f "$prefix/.esim-install-complete" ]; then
+        mkdir -p "$source_dir"
+        if [ ! -d "$source_dir/.git" ]; then
+            git init "$source_dir"
+            git -C "$source_dir" remote add origin https://github.com/thliebig/openEMS-Project.git
+        fi
+        git -C "$source_dir" fetch --depth 1 origin "$revision"
+        git -C "$source_dir" checkout --detach FETCH_HEAD
+        git -C "$source_dir" submodule update --init --recursive
+        cmake -S "$source_dir" -B "$source_dir/build" \
+            -DCMAKE_INSTALL_PREFIX="$prefix" -DBUILD_APPCSXCAD=NO
+        cmake --build "$source_dir/build" --parallel 2
+        "$prefix/bin/openEMS" --help >/dev/null 2>&1 \
+            || die "The newly built openEMS solver could not run."
+        touch "$prefix/.esim-install-complete"
+    fi
+
+    mkdir -p "$HOME/.local/bin"
+    printf '#!/bin/bash\nexec "%s/bin/openEMS" "$@"\n' "$prefix" > "$launcher"
+    chmod 755 "$launcher"
+    export PATH="$HOME/.local/bin:$PATH"
+    "$launcher" --help >/dev/null 2>&1 || die "openEMS verification failed."
+    # Remember the verified launcher for desktop and IDE runs.
+    "$config_dir/env/bin/python3" - "$launcher" <<'PYSETTINGS'
+import sys
+from PyQt6.QtCore import QSettings
+
+settings = QSettings('eSim', 'eSim')
+settings.setValue('openEMS/executable', sys.argv[1])
+settings.sync()
+if settings.status() != QSettings.Status.NoError:
+    sys.exit("Could not save the openEMS executable path.")
+PYSETTINGS
+    log "openEMS solver installed at $prefix"
+}
+
 installIhpPdk() {
     local script="$eSim_Home/ihp/ihp-install-script.sh"
     [ -f "$script" ] || { warn "IHP install script not found — skipping"; return 0; }
@@ -1103,6 +1151,7 @@ createDesktopStartScript() {
     # All three vars are defaulted-not-forced (`:=`), so a user can still override.
     {
         echo '#!/bin/bash'
+        echo 'export PATH="$HOME/.local/bin:$PATH"'
         echo ': "${LIBGL_ALWAYS_SOFTWARE:=1}"; export LIBGL_ALWAYS_SOFTWARE'
         echo ': "${QT_OPENGL:=software}"; export QT_OPENGL'
         echo ': "${EGL_LOG_LEVEL:=fatal}"; export EGL_LOG_LEVEL'
