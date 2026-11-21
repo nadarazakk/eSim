@@ -504,6 +504,8 @@ class Welcome(QtWidgets.QWidget):
             ('Modelica', 'omedit.png', 'Convert to Modelica format', 'omedit'),
             ('OM Optimisation', 'omoptim.png', 'Open OpenModelica optimiser', 'omoptim'),
             ('Schematic Converter', 'icon.png', 'Import PSpice / LTspice files', 'conToeSim'),
+            # Open the same simulation dialog as the Tools menu.
+            ('Run openEMS', 'openEMS_logo.png', 'Run an openEMS XML model', 'run_openems'),
         ]
 
         cols = 3

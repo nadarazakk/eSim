@@ -608,6 +608,7 @@ class Application(QtWidgets.QMainWindow):
         tools_menu.addAction(self.kicad)
         tools_menu.addAction(self.conversion)
         tools_menu.addAction(self.ngspice)
+        tools_menu.addAction("Run openEMS…", self.run_openems)
         tools_menu.addSeparator()
         tools_menu.addAction(self.model)
         tools_menu.addAction(self.subcircuit)
@@ -644,6 +645,16 @@ class Application(QtWidgets.QMainWindow):
                 make_menu_rounded(_m)
         except Exception:
             pass
+
+    def run_openems(self):
+        from frontEnd.OpenEMSDialog import OpenEMSDialog
+
+        # Keep the log available when the user reopens the tool.
+        if not hasattr(self, 'openems_dialog'):
+            self.openems_dialog = OpenEMSDialog(self)
+        self.openems_dialog.show()
+        self.openems_dialog.raise_()
+        self.openems_dialog.activateWindow()
 
     def _refresh_recent_projects_menu(self):
         """Populate the Recent Projects submenu from project_explorer."""
