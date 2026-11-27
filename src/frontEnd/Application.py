@@ -44,6 +44,7 @@ from projManagement.newProject import NewProjectInfo
 from projManagement.Kicad import Kicad
 from projManagement.Validation import Validation
 from projManagement import Worker
+from projManagement.projectPaths import canonical_path
 
 # Its our main window of application.
 
@@ -511,10 +512,10 @@ class Application(QtWidgets.QMainWindow):
         self.lefttoolbar.addAction(self.ngspice)
         # Share the openEMS action with the Tools menu.
         self.openems = self.lefttoolbar.addAction(
-            QtGui.QIcon(paths.image_path('openEMS.svg')), "Run openEMS", self.run_openems)
+            QtGui.QIcon(paths.image_path('openEMS.svg')), "openEMS Simulations…", self.run_openems)
         self.openems.setShortcut("Ctrl+Alt+E")
         self.openems.setToolTip(
-            "Run openEMS (Ctrl+Alt+E) - Run an openEMS XML model")
+            "Set up and run openEMS models for the active project")
         self.openems.setIconVisibleInMenu(False)
         self.lefttoolbar.addSeparator()
         self.lefttoolbar.addWidget(_rail_caption("MODEL"))
@@ -654,14 +655,12 @@ class Application(QtWidgets.QMainWindow):
             pass
 
     def run_openems(self):
-        from frontEnd.OpenEMSDialog import OpenEMSDialog
-
-        # Keep the log available when the user reopens the tool.
-        if not hasattr(self, 'openems_dialog'):
-            self.openems_dialog = OpenEMSDialog(self)
-        self.openems_dialog.show()
-        self.openems_dialog.raise_()
-        self.openems_dialog.activateWindow()
+        project_path = canonical_path(self.obj_appconfig.current_project["ProjectName"])
+        if not project_path or not self.obj_validation.validateOpenproj(project_path):
+            from frontEnd.dialogs import show_warning
+            show_warning(self, "openEMS Simulations…", "Open or create an eSim project first.")
+            return
+        self.obj_Mainview.obj_projectExplorer.openOpenEMS(project_path)
 
     def _refresh_recent_projects_menu(self):
         """Populate the Recent Projects submenu from project_explorer."""

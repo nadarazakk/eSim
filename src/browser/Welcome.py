@@ -504,8 +504,8 @@ class Welcome(QtWidgets.QWidget):
             ('Modelica', 'omedit.png', 'Convert to Modelica format', 'omedit'),
             ('OM Optimisation', 'omoptim.png', 'Open OpenModelica optimiser', 'omoptim'),
             ('Schematic Converter', 'icon.png', 'Import PSpice / LTspice files', 'conToeSim'),
-            # Open the same simulation dialog as the Tools menu.
-            ('Run openEMS', 'openEMS.svg', 'Run an openEMS XML model', 'openems'),
+            ('openEMS Simulations…', 'openEMS.svg',
+             'Set up and run openEMS models for the active project', 'openems'),
         ]
 
         cols = 3
@@ -519,6 +519,8 @@ class Welcome(QtWidgets.QWidget):
                 attr,
                 self.trigger_action,
             )
+            if attr == 'openems':
+                card.setToolTip(desc)
             self._apply_tile_shadow(card, blur=26, y=6, alpha=48,
                                     radius=ToolCard.RADIUS)
             grid.addWidget(card, row, col)
