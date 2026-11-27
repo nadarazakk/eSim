@@ -8,6 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from frontEnd.OpenEMSProject import ProjectRuns
 from frontEnd.OpenEMSTemplates import (
+    BENT_PATCH,
     CIRCULAR_WAVEGUIDE,
     CYLINDRICAL_WAVE,
     RECTANGULAR_WAVEGUIDE,
@@ -19,17 +20,18 @@ from frontEnd.OpenEMSTemplates import (
 
 
 @pytest.mark.parametrize(
-    "template,parameter",
+    "template,parameter,value",
     [
-        ("Parallel Plate Waveguide", "gap"),
-        ("Microstrip Notch Filter", "stub"),
-        ("Simple Patch Antenna", "width"),
-        (RECTANGULAR_WAVEGUIDE, "length"),
-        (CIRCULAR_WAVEGUIDE, "radial_spacing"),
-        (CYLINDRICAL_WAVE, "resolution"),
+        ("Parallel Plate Waveguide", "gap", 15.0),
+        ("Microstrip Notch Filter", "stub", 15.0),
+        ("Simple Patch Antenna", "width", 15.0),
+        (RECTANGULAR_WAVEGUIDE, "length", 15.0),
+        (CIRCULAR_WAVEGUIDE, "radial_spacing", 15.0),
+        (CYLINDRICAL_WAVE, "resolution", 15.0),
+        (BENT_PATCH, "radius", 65.0),
     ],
 )
-def test_edit_generate_and_archive(tmp_path, template, parameter):
+def test_edit_generate_and_archive(tmp_path, template, parameter, value):
     store = ProjectRuns(tmp_path)
     values = {key: default for key, _, _, default, _, _ in TEMPLATES[template]}
     model = save_model(store, "baseline", template, values)
@@ -37,7 +39,7 @@ def test_edit_generate_and_archive(tmp_path, template, parameter):
     assert read_setup(model) == (template, values)
     original = model.read_bytes()
     _, archived = store.prepare(model, ET.parse(model))
-    updated = dict(values, **{parameter: 15.0})
+    updated = dict(values, **{parameter: value})
     with pytest.raises(ValueError, match="exists"):
         save_model(store, "baseline", template, updated)
     variant = save_model(store, "variant", template, updated, editing=model)
@@ -177,3 +179,39 @@ def test_invalid_cylindrical_wave(changes):
     values = {key: default for key, _, _, default, _, _ in TEMPLATES[CYLINDRICAL_WAVE]}
     with pytest.raises(ValueError):
         build_model(CYLINDRICAL_WAVE, {**values, **changes})
+
+
+@pytest.mark.parametrize("radius", [50.0, 65.0])
+def test_bent_patch_geometry_and_recording_surface(radius):
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[BENT_PATCH]}
+    model = build_model(BENT_PATCH, dict(values, radius=radius))
+    assert model.find("FDTD").get("CylinderCoords") == "1"
+    assert model.find("ContinuousStructure").get("CoordSystem") == "1"
+    props = model.find(".//Properties")
+    patch = props.find("Metal[@Name='patch']//Box")
+    outer = radius + values["height"]
+    assert float(patch.find("P1").get("X")) == float(patch.find("P2").get("X")) == outer
+    assert float(patch.find("P2").get("Y")) * 2 * outer == pytest.approx(values["width"])
+    feed = props.find("LumpedElement")
+    assert feed.get("Direction") == "0" and float(feed.get("R")) == values["resistance"]
+    assert float(feed.find(".//P1").get("X")) == radius
+    assert float(feed.find(".//P2").get("X")) == outer
+    assert float(feed.find(".//P1").get("Y")) * radius == pytest.approx(values["feed_offset"])
+    assert props.find("ProbeBox[@Name='port_it1']").get("NormDir") == "0"
+    electric = props.find("DumpBox[@Name='nf2ff_E']")
+    magnetic = props.find("DumpBox[@Name='nf2ff_H']")
+    assert (electric.get("DumpType"), magnetic.get("DumpType")) == ("0", "1")
+    assert ET.tostring(electric.find("Primitives")) == ET.tostring(magnetic.find("Primitives"))
+    faces = electric.findall(".//Box")
+    assert len(faces) == 6
+    for face, axis in zip(faces, "XXYYZZ"):
+        assert face.find("P1").get(axis) == face.find("P2").get(axis)
+
+
+@pytest.mark.parametrize("changes", [
+    {"width": 90.0}, {"length": 91.0}, {"feed_offset": -15.9}, {"cutoff": 2.0, "frequency": 1.0},
+])
+def test_invalid_bent_patch(changes):
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[BENT_PATCH]}
+    with pytest.raises(ValueError):
+        build_model(BENT_PATCH, {**values, **changes})

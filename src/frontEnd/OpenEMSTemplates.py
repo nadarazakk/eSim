@@ -12,6 +12,9 @@ GEOMETRY = "Geometry & Materials"
 EXCITATION = "Excitation & Ports"
 SIMULATION = "Simulation Settings"
 PATCH_ANTENNA = "Simple Patch Antenna"
+BENT_PATCH = "Bent Patch Antenna"
+BENT_SUBSTRATE_WIDTH = 80.0  # Arc length at the ground plane, in mm.
+BENT_SUBSTRATE_LENGTH = 90.0
 RECTANGULAR_WAVEGUIDE = "Rectangular Waveguide"
 CIRCULAR_WAVEGUIDE = "Circular Waveguide"
 CYLINDRICAL_WAVE = "2D Cylindrical Wave"
@@ -48,6 +51,18 @@ TEMPLATES = {
         ("resistance", EXCITATION, "Feed resistance (Ω)", 50.0, 1.0, 500.0),
         ("frequency", EXCITATION, "Gaussian center frequency (GHz)", 2.0, 1.0, 6.0),
         ("cutoff", EXCITATION, "Gaussian 20 dB bandwidth (±GHz)", 1.0, 0.1, 3.0),
+        ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
+    ],
+    BENT_PATCH: [
+        ("radius", GEOMETRY, "Bend radius at ground (mm)", 50.0, 30.0, 100.0),
+        ("width", GEOMETRY, "Patch arc width (mm)", 32.0, 5.0, 100.0),
+        ("length", GEOMETRY, "Patch axial length (mm)", 40.0, 5.0, 100.0),
+        ("height", GEOMETRY, "Substrate thickness (mm)", 1.524, 0.5, 5.0),
+        ("epsilon", GEOMETRY, "Substrate relative permittivity", 3.38, 1.0, 10.0),
+        ("feed_offset", EXCITATION, "Feed arc offset at ground (mm)", -5.5, -40.0, 40.0),
+        ("resistance", EXCITATION, "Feed resistance (Ω)", 50.0, 1.0, 500.0),
+        ("frequency", EXCITATION, "Gaussian center frequency (GHz)", 2.0, 1.0, 4.0),
+        ("cutoff", EXCITATION, "Gaussian 20 dB bandwidth (±GHz)", 1.0, 0.25, 2.0),
         ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
     ],
     RECTANGULAR_WAVEGUIDE: [
@@ -103,6 +118,14 @@ def validate(template, values):
             or abs(values["feed_y"]) >= values["length"] / 2
         ):
             raise ValueError("The feed must be inside the patch.")
+    if template == BENT_PATCH:
+        radius = values["radius"]
+        patch_angle = values["width"] / (radius + values["height"])
+        if patch_angle > BENT_SUBSTRATE_WIDTH / radius or values["length"] > BENT_SUBSTRATE_LENGTH:
+            raise ValueError("The patch must fit on the 80 mm arc by 90 mm axial substrate.")
+        if abs(values["feed_offset"]) / radius >= patch_angle / 2:
+            raise ValueError("The radial feed must lie inside the patch.")
+    if template in (PATCH_ANTENNA, BENT_PATCH):
         if values["cutoff"] > values["frequency"]:
             raise ValueError("Gaussian bandwidth must not exceed the center frequency.")
     if template in (RECTANGULAR_WAVEGUIDE, CIRCULAR_WAVEGUIDE):
@@ -336,19 +359,81 @@ def patch_antenna(props, p):
     box(patch, [-width, -length, height], [width, length, height], 10)
 
     start, stop = [feed_x, feed_y, 0], [feed_x, feed_y, height]
-    resistor = ET.SubElement(
-        props, "LumpedElement", Name="port_resist_1", Direction="2", Caps="1",
-        R=str(p["resistance"]),
-    )
-    box(resistor, start, stop, 5)
-    source = ET.SubElement(props, "Excitation", Name="port_excite_1", Type="0", Excite="0,0,-1")
-    box(source, start, stop, 5)
-    voltage = ET.SubElement(props, "ProbeBox", Name="port_ut1", Type="0", Weight="-1")
-    box(voltage, start, stop, 5)
-    current = ET.SubElement(props, "ProbeBox", Name="port_it1", Type="1", Weight="1", NormDir="2")
-    midpoint = [feed_x, feed_y, height / 2]
-    box(current, midpoint, midpoint, 5)
+    lumped_feed(props, p["resistance"], start, stop, 2, 5)
     return axes
+
+
+def lumped_feed(props, resistance, start, stop, direction, priority):
+    resistor = ET.SubElement(
+        props, "LumpedElement", Name="port_resist_1", Direction=str(direction), Caps="1",
+        R=str(resistance),
+    )
+    box(resistor, start, stop, priority)
+    vector = ["0", "0", "0"]
+    vector[direction] = "-1"
+    source = ET.SubElement(
+        props, "Excitation", Name="port_excite_1", Type="0", Excite=",".join(vector)
+    )
+    box(source, start, stop, priority)
+    voltage = ET.SubElement(props, "ProbeBox", Name="port_ut1", Type="0", Weight="-1")
+    box(voltage, start, stop, priority)
+    current = ET.SubElement(
+        props, "ProbeBox", Name="port_it1", Type="1", Weight="1", NormDir=str(direction)
+    )
+    midpoint = list(start)
+    midpoint[direction] = (start[direction] + stop[direction]) / 2
+    box(current, midpoint, midpoint, priority)
+
+
+def bent_patch(props, p):
+    radius = p["radius"]
+    outer = radius + p["height"]
+    patch_angle = p["width"] / (2 * outer)
+    board_angle = BENT_SUBSTRATE_WIDTH / (2 * radius)
+    feed_angle = p["feed_offset"] / radius
+    patch_z, board_z = p["length"] / 2, BENT_SUBSTRATE_LENGTH / 2
+
+    substrate = ET.SubElement(props, "Material", Name="substrate")
+    # Tutorial substrate loss tangent of 0.001 at 2.4 GHz.
+    conductivity = 0.001 * math.tau * 2.4e9 * 8.8541878128e-12 * p["epsilon"]
+    ET.SubElement(substrate, "Property", Epsilon=str(p["epsilon"]), Kappa=str(conductivity))
+    box(substrate, [radius, -board_angle, -board_z], [outer, board_angle, board_z])
+    ground = ET.SubElement(props, "Metal", Name="ground")
+    box(ground, [radius, -board_angle, -board_z], [radius, board_angle, board_z], 10)
+    patch = ET.SubElement(props, "Metal", Name="patch")
+    box(patch, [outer, -patch_angle, -patch_z], [outer, patch_angle, patch_z], 10)
+    lumped_feed(props, p["resistance"], [radius, feed_angle, 0], [outer, feed_angle, 0], 0, 50)
+
+    spacing = LIGHT_SPEED_MM_PER_NS / (20 * (p["frequency"] + p["cutoff"]))
+    radial_end = radius + 200
+    # Record broadband E and H on a closed surface in air around the antenna.
+    lower = [radius - 10, -board_angle - 10 / radius, -board_z - 10]
+    upper = [outer + 10, board_angle + 10 / radius, board_z + 10]
+    for field, kind in (("E", "0"), ("H", "1")):
+        dump = ET.SubElement(
+            props, "DumpBox", Name="nf2ff_" + field, DumpType=kind, FileType="1", DumpMode="1"
+        )
+        for axis in range(3):
+            for plane in (lower[axis], upper[axis]):
+                start, stop = lower.copy(), upper.copy()
+                start[axis] = stop[axis] = plane
+                box(dump, start, stop)
+
+    radial = (
+        grid_axis([radius - 20, lower[0], radius], spacing)[:-1]
+        + series(radius, outer, 4)
+        + grid_axis([outer, upper[0], radial_end], spacing)[1:]
+    )
+    sector = 0.75 * math.pi
+    angular = grid_axis(
+        [-sector, lower[1], -board_angle, -patch_angle, feed_angle,
+         patch_angle, board_angle, upper[1], sector],
+        spacing / radial_end,
+    )
+    axial = grid_axis(
+        [-150, lower[2], -board_z, -patch_z, 0, patch_z, board_z, upper[2], 150], spacing
+    )
+    return radial, angular, axial
 
 
 def build_model(template, values):
@@ -368,13 +453,13 @@ def build_model(template, values):
         ET.SubElement(fdtd, "Excitation", Type="1", f0=str(values["frequency"] * 1e6))
         boundaries = ["PMC", "PMC", "PEC", "PEC", "MUR", "MUR"]
         geometry = waveguide
-    elif template == PATCH_ANTENNA:
+    elif template in (PATCH_ANTENNA, BENT_PATCH):
         ET.SubElement(
             fdtd, "Excitation", Type="0", f0=str(values["frequency"] * 1e9),
             fc=str(values["cutoff"] * 1e9),
         )
         boundaries = ["MUR"] * 6
-        geometry = patch_antenna
+        geometry = bent_patch if template == BENT_PATCH else patch_antenna
     elif template == CYLINDRICAL_WAVE:
         f0 = values["frequency"] * 1e9
         ET.SubElement(fdtd, "Excitation", Type="0", f0=str(f0), fc=str(f0 / 2))
@@ -402,7 +487,7 @@ def build_model(template, values):
     )
     csx = ET.SubElement(root, "ContinuousStructure", CoordSystem="0")
     grid = ET.SubElement(csx, "RectilinearGrid", DeltaUnit="1" if plate else "0.001")
-    if circular or template == CYLINDRICAL_WAVE:
+    if template in (CIRCULAR_WAVEGUIDE, CYLINDRICAL_WAVE, BENT_PATCH):
         fdtd.set("CylinderCoords", "1")
         fdtd.set("endCriteria", "1e-4")
         csx.set("CoordSystem", "1")
