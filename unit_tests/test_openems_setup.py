@@ -10,6 +10,7 @@ from frontEnd.OpenEMSProject import ProjectRuns
 from frontEnd.OpenEMSTemplates import (
     BENT_PATCH,
     CIRCULAR_WAVEGUIDE,
+    CONICAL_HORN,
     CYLINDRICAL_WAVE,
     PIN_FEED_HORN,
     RECTANGULAR_WAVEGUIDE,
@@ -33,6 +34,7 @@ from frontEnd.OpenEMSTemplates import (
         (CYLINDRICAL_WAVE, "resolution", 15.0),
         (BENT_PATCH, "radius", 65.0),
         (PIN_FEED_HORN, "pin_length", 6.5),
+        (CONICAL_HORN, "angle", 25.0),
     ],
 )
 def test_edit_generate_and_archive(tmp_path, template, parameter, value):
@@ -298,3 +300,49 @@ def test_pin_feed_horn_geometry_and_recording_surface(pin_length):
             mesh = list(map(float, model.findtext(f".//{axis}Lines").split(",")))
             assert float(faces[index * 2].find("P1").get(axis)) == mesh[9]
             assert float(faces[index * 2 + 1].find("P2").get(axis)) == mesh[-10]
+
+
+@pytest.mark.parametrize("changes,message", [
+    ({"f_min": 20.0}, "lower band edge"),
+    ({"f_ref": 9.0}, "within the simulation band"),
+    ({"radius": 5.0}, "TE₁₁ cutoff"),
+])
+def test_invalid_conical_horn(changes, message):
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[CONICAL_HORN]}
+    with pytest.raises(ValueError, match=message):
+        build_model(CONICAL_HORN, {**values, **changes})
+
+
+@pytest.mark.parametrize("angle", [20.0, 25.0])
+def test_conical_horn_profile_port_and_recording_surface(angle):
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[CONICAL_HORN]}
+    model = build_model(CONICAL_HORN, dict(values, angle=angle))
+    csx = model.find("ContinuousStructure")
+    assert csx.get("CoordSystem") == "0"
+    assert list(model.find("FDTD/BoundaryCond").attrib.values()) == ["PML_8"] * 6
+    props = csx.find("Properties")
+    assert len(props.findall("Metal/Primitives/*")) == 1
+    horn = props.find("Metal/Primitives/RotPoly")
+    assert horn.get("NormDir") == "0"
+    assert horn.get("RotAxisDir") == "2"
+    assert float(horn.find("Angles").get("Stop")) == math.tau
+    radius = values["radius"]
+    aperture = radius + values["length"] * math.sin(math.radians(angle))
+    profile = [(float(v.get("X1")), float(v.get("X2"))) for v in horn.findall("Vertex")]
+    assert profile == [
+        (radius + 2, -50), (radius + 2, 0), (aperture + 2, 50),
+        (aperture, 50), (radius, 0), (radius, -50),
+    ]
+    source = props.find("Excitation")
+    voltage, current = props.findall("ProbeBox")
+    assert (voltage.get("Type"), current.get("Type")) == ("10", "11")
+    assert source.find("Weight").attrib == voltage.find("ModeFunction").attrib
+    assert current.find("ModeFunction").get("Y") == voltage.find("ModeFunction").get("X")
+    mesh = list(map(float, csx.findtext("RectilinearGrid/ZLines").split(",")))
+    assert mesh[8] < float(source.find(".//P1").get("Z")) < float(voltage.find(".//P1").get("Z")) < 0
+    for field in "EH":
+        faces = props.findall(f"DumpBox[@Name='nf2ff_{field}']//Box")
+        assert len(faces) == 5
+        for face, axis in zip(faces, "XXYYZ"):
+            assert face.find("P1").get(axis) == face.find("P2").get(axis)
+        assert float(faces[-1].find("P1").get("Z")) > values["length"]

@@ -20,6 +20,7 @@ RECTANGULAR_WAVEGUIDE = "Rectangular Waveguide"
 CIRCULAR_WAVEGUIDE = "Circular Waveguide"
 CYLINDRICAL_WAVE = "2D Cylindrical Wave"
 PIN_FEED_HORN = "Horn Antenna with Coaxial Pin Feed"
+CONICAL_HORN = "Conical Horn Antenna"
 HORN_FEED_LENGTH = 50.0  # mm
 HORN_PIN_HALF_WIDTH = 0.5
 HORN_PORT_GAP = 1.0
@@ -120,6 +121,17 @@ TEMPLATES = {
         ("f_ref", EXCITATION, "Back-short reference frequency (GHz)", 15.0, 2.0, 30.0),
         ("steps", SIMULATION, "Maximum time steps", 20000, 1000, 200000),
     ],
+    CONICAL_HORN: [
+        ("radius", GEOMETRY, "Feed waveguide inner radius (mm)", 20.0, 5.0, 40.0),
+        ("feed_length", GEOMETRY, "Feed waveguide length (mm)", 50.0, 15.0, 100.0),
+        ("length", GEOMETRY, "Horn axial length (mm)", 50.0, 10.0, 100.0),
+        ("thickness", GEOMETRY, "Wall thickness (mm)", 2.0, 0.5, 10.0),
+        ("angle", GEOMETRY, "Flare angle (degrees)", 20.0, 5.0, 45.0),
+        ("f_min", EXCITATION, "Lower band edge (GHz)", 10.0, 2.0, 30.0),
+        ("f_max", EXCITATION, "Upper band edge (GHz)", 20.0, 2.0, 30.0),
+        ("f_ref", EXCITATION, "Reference frequency (GHz)", 15.0, 2.0, 30.0),
+        ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
+    ],
 }
 
 
@@ -136,12 +148,17 @@ def validate(template, values):
             raise ValueError(f"{label} must be between {minimum} and {maximum}.")
     if template == STRIPLINE_TRANSITION and values["clearance_diameter"] <= values["via_diameter"]:
         raise ValueError("The ground-plane clearance must be wider than the via.")
-    if template == PIN_FEED_HORN:
+    if template in (PIN_FEED_HORN, CONICAL_HORN):
         reference = values["f_ref"]
         if values["f_min"] >= values["f_max"]:
             raise ValueError("The lower band edge must be below the upper band edge.")
         if not values["f_min"] <= reference <= values["f_max"]:
-            raise ValueError("The back-short reference frequency must lie within the simulation band.")
+            raise ValueError("The reference frequency must lie within the simulation band.")
+    if template == CONICAL_HORN:
+        cutoff = LIGHT_SPEED_MM_PER_NS * TE11_ROOT / (math.tau * values["radius"])
+        if reference <= cutoff:
+            raise ValueError(f"The reference frequency must exceed the TE₁₁ cutoff ({cutoff:.3f} GHz).")
+    if template == PIN_FEED_HORN:
         cutoff = LIGHT_SPEED_MM_PER_NS / (2 * values["width"])
         if reference <= cutoff:
             raise ValueError(f"The reference frequency must exceed the TE₁₀ cutoff ({cutoff:.3f} GHz).")
@@ -280,19 +297,28 @@ def circular_waveguide(props, p):
 
 
 def waveguide_ports(props, cross_section, z, electric, magnetic):
+    waveguide_source(props, [0, 0, z[10]], [*cross_section, z[10]], electric)
+    for port, plane, direction in ((1, z[14], 1), (2, z[-15], -1)):
+        waveguide_probes(props, port, [0, 0, plane], [*cross_section, plane],
+                         electric, magnetic, direction)
+
+
+def waveguide_source(props, start, stop, electric):
     source = ET.SubElement(props, "Excitation", Name="port_excite_1", Type="0", Excite="1,1,0")
     ET.SubElement(source, "Weight", electric)
-    box(source, [0, 0, z[10]], [*cross_section, z[10]])
-    for port, plane, direction in ((1, z[14], 1), (2, z[-15], -1)):
-        for prefix, kind, profile, weight in (
-            ("port_ut", "10", electric, 1),
-            ("port_it", "11", magnetic, direction),
-        ):
-            probe = ET.SubElement(
-                props, "ProbeBox", Name=f"{prefix}{port}", Type=kind, Weight=str(weight)
-            )
-            ET.SubElement(probe, "ModeFunction", profile)
-            box(probe, [0, 0, plane], [*cross_section, plane])
+    box(source, start, stop)
+
+
+def waveguide_probes(props, port, start, stop, electric, magnetic, direction):
+    for prefix, kind, profile, weight in (
+        ("port_ut", "10", electric, 1),
+        ("port_it", "11", magnetic, direction),
+    ):
+        probe = ET.SubElement(
+            props, "ProbeBox", Name=f"{prefix}{port}", Type=kind, Weight=str(weight)
+        )
+        ET.SubElement(probe, "ModeFunction", profile)
+        box(probe, start, stop)
 
 
 def cylindrical_wave(props, p):
@@ -507,15 +533,16 @@ def lumped_feed(props, resistance, start, stop, direction, priority):
     box(current, current_start, current_stop, priority)
 
 
-def nf2ff_surface(props, lower, upper):
+def nf2ff_surface(props, lower, upper, *, directions=(True,) * 6):
     for field, kind in (("E", "0"), ("H", "1")):
         dump = ET.SubElement(
             props, "DumpBox", Name="nf2ff_" + field, DumpType=kind, FileType="1", DumpMode="1"
         )
-        for axis in range(3):
-            for plane in (lower[axis], upper[axis]):
+        for face, enabled in enumerate(directions):
+            if enabled:
+                axis, side = divmod(face, 2)
                 start, stop = list(lower), list(upper)
-                start[axis] = stop[axis] = plane
+                start[axis] = stop[axis] = (lower, upper)[side][axis]
                 box(dump, start, stop)
 
 
@@ -629,6 +656,50 @@ def pin_feed_horn(props, p):
     ]
 
 
+def conical_horn(props, p):
+    radius, feed, length = p["radius"], p["feed_length"], p["length"]
+    wall = p["thickness"]
+    aperture = radius + length * math.sin(math.radians(p["angle"]))
+    horn = ET.SubElement(props, "Metal", Name="horn")
+    profile = [(radius + wall, -feed), (radius + wall, 0), (aperture + wall, length),
+               (aperture, length), (radius, 0), (radius, -feed)]
+    swept = ET.SubElement(
+        ET.SubElement(horn, "Primitives"), "RotPoly", Priority="10", NormDir="0",
+        Elevation="0", RotAxisDir="2", QtyVertices=str(len(profile)),
+    )
+    for r, z in profile:
+        ET.SubElement(swept, "Vertex", X1=str(r), X2=str(z))
+    ET.SubElement(swept, "Angles", Start="0", Stop=str(math.tau))
+
+    spacing = LIGHT_SPEED_MM_PER_NS / (15 * p["f_max"])
+    air = LIGHT_SPEED_MM_PER_NS / (4 * p["f_ref"])
+    side = aperture + wall + air
+    transverse = grid_axis(
+        [-side - 9 * spacing, -side, -radius, 0, radius, side, side + 9 * spacing], spacing
+    )
+    half_feed_cells = max(12, math.ceil(feed / (2 * spacing)))
+    axial = series(-feed, 0, 2 * half_feed_cells)
+    front = length + 2 * air
+    axial += grid_axis([0, length, front, front + 9 * spacing], spacing)[1:]
+    nf2ff_surface(
+        props, [-side, -side, axial[9]], [side, side, front],
+        directions=(True, True, True, True, False, True),
+    )
+
+    # Cartesian TE11 electric field, with a finite Bessel-function limit on
+    # axis and zero weight outside the circular guide.
+    u = f"{TE11_ROOT / radius}*rho"
+    ex = f"-(j0({u})+jn(2,{u})*cos(2*a))/2"
+    ey = f"-jn(2,{u})*sin(2*a)/2"
+    electric = {"X": f"if(rho<{radius},{ex},0)", "Y": f"if(rho<{radius},{ey},0)", "Z": "0"}
+    magnetic = {"X": f"-({electric['Y']})", "Y": electric["X"], "Z": "0"}
+    source, probe = axial[9], axial[half_feed_cells]
+    waveguide_source(props, [-radius, -radius, source], [radius, radius, source], electric)
+    waveguide_probes(props, 1, [-radius, -radius, probe], [radius, radius, probe],
+                     electric, magnetic, 1)
+    return transverse, transverse, axial
+
+
 def build_model(template, values):
     validate(template, values)
     settings = json.dumps({"template": template, "values": values}, allow_nan=False)
@@ -659,17 +730,17 @@ def build_model(template, values):
         fdtd.set("MultiGrid", ",".join(str(values["radius"] / d) for d in RADIAL_SPLIT_DIVISORS))
         boundaries = ["PEC", "PML_8", "PEC", "PEC", "PEC", "PEC"]
         geometry = cylindrical_wave
-    elif template in (RECTANGULAR_WAVEGUIDE, CIRCULAR_WAVEGUIDE, PIN_FEED_HORN):
+    elif template in (RECTANGULAR_WAVEGUIDE, CIRCULAR_WAVEGUIDE, PIN_FEED_HORN, CONICAL_HORN):
         hz = 1e6 if circular else 1e9
         ET.SubElement(
             fdtd, "Excitation", Type="0",
             f0=str((values["f_max"] + values["f_min"]) * 0.5 * hz),
             fc=str((values["f_max"] - values["f_min"]) * 0.5 * hz),
         )
-        if template == PIN_FEED_HORN:
+        if template in (PIN_FEED_HORN, CONICAL_HORN):
             fdtd.set("endCriteria", "1e-4")
             boundaries = ["PML_8"] * 6
-            geometry = pin_feed_horn
+            geometry = pin_feed_horn if template == PIN_FEED_HORN else conical_horn
         else:
             boundaries = ["PEC", "PEC", "PEC", "PEC", "PML_8", "PML_8"]
             geometry = circular_waveguide if circular else rectangular_waveguide
