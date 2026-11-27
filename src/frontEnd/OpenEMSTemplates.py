@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import shutil
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from xml.etree import ElementTree as ET
@@ -26,6 +27,9 @@ CRLH_EXTRACTION = "CRLH Parameter Extraction"
 SPHERE_RCS = "Metal Sphere Radar Cross Section"
 UWB_RADAR = "UWB Radar — Delay and Fidelity"
 DIPOLE_SAR = "Dipole Antenna Exposure & SAR"
+MRI_LOOP_COIL = "7T MRI Loop Coil"
+MRI_PHANTOM = "phantom_head_298MHz.h5"
+MRI_FREQUENCY = 298e6
 # Tutorial centre frequency and channel half-bandwidth, in GHz.
 UWB_CHANNELS = {
     1: (3.5, 0.25), 2: (4.0, 0.25), 3: (4.5, 0.25),
@@ -177,6 +181,12 @@ TEMPLATES = {
     DIPOLE_SAR: [
         ("frequency", EXCITATION, "Dipole frequency (GHz)", 1.0, 0.5, 2.0),
         ("distance", GEOMETRY, "Distance from dipole to phantom surface (mm)", 20.0, 5.0, 120.0),
+        ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
+    ],
+    MRI_LOOP_COIL: [
+        ("width", GEOMETRY, "Loop width (mm)", 60.0, 20.0, 140.0),
+        ("length", GEOMETRY, "Loop length (mm)", 80.0, 20.0, 160.0),
+        ("capacitance", EXCITATION, "Tuning capacitance per gap (pF)", 5.4, 0.1, 100.0),
         ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
     ],
 }
@@ -952,6 +962,52 @@ def dipole_sar(props, p):
     return axes
 
 
+def mri_loop_coil(props, p):
+    width, length = p["width"] / 2, p["length"] / 2
+    x, strip = -130, 5
+    half_gap = strip / 6
+    cap_y, cap_z = width - strip / 2, length - strip / 2
+    loop = ET.SubElement(props, "Metal", Name="loop")
+    for y1, y2 in ((-width, -half_gap), (half_gap, width)):
+        box(loop, [x, y1, -length], [x, y2, -length + strip], 10)
+        box(loop, [x, y1, length - strip], [x, y2, length], 10)
+    for z1, z2 in ((-length + strip, -half_gap), (half_gap, length - strip)):
+        box(loop, [x, -width, z1], [x, -width + strip, z2], 10)
+        box(loop, [x, width - strip, z1], [x, width, z2], 10)
+    capacitance = str(p["capacitance"] * 1e-12)
+    caps_z = ET.SubElement(props, "LumpedElement", Name="caps_z", Direction="2", Caps="1", C=capacitance)
+    for y in (-cap_y, cap_y):
+        box(caps_z, [x, y - half_gap, -half_gap], [x, y + half_gap, half_gap], 10)
+    caps_y = ET.SubElement(props, "LumpedElement", Name="caps_y", Direction="1", Caps="1", C=capacitance)
+    box(caps_y, [x, -half_gap, cap_z - half_gap], [x, half_gap, cap_z + half_gap], 10)
+    lumped_feed(props, 2.5, [x, -half_gap, -cap_z - half_gap],
+                [x, half_gap, -cap_z + half_gap], 1, 5)
+
+    low, high = [-120, -150, -200], [100, 150, 130]
+    phantom = ET.SubElement(props, "DiscMaterial", Name="head_phantom")
+    ET.SubElement(phantom, "DiscFile", Type="0", File=MRI_PHANTOM, Scale="1000", UseDBBackground="1")
+    box(phantom, low, high)
+    for plane, normal in (("xy", 2), ("xz", 1)):
+        start, stop = low.copy(), high.copy()
+        start[normal] = stop[normal] = 0
+        for name, kind, mode in (("Hf", "11", "0"), ("SAR", "20", "2")):
+            dump = ET.SubElement(props, "DumpBox", Name=f"{name}_{plane}",
+                                 DumpType=kind, DumpMode=mode, FileType="1")
+            ET.SubElement(dump, "FD_Samples").text = str(MRI_FREQUENCY)
+            box(dump, start, stop)
+
+    mesh = []
+    for core, start, stop in (
+        ([x, -120, -1, 1, 100], -320, 300),
+        ([-80, -width, -width + strip, -half_gap, 0, half_gap, width - strip, width, 80], -280, 280),
+        ([-120, -length, -length + strip, -half_gap, 0, half_gap, length - strip, length, 120], -320, 320),
+    ):
+        coarse = LIGHT_SPEED_MM_PER_NS / (40 * 0.598)
+        mesh.append(grid_axis([start, core[0]], coarse)[:-1] + grid_axis(core, 2)
+                    + grid_axis([core[-1], stop], coarse)[1:])
+    return mesh
+
+
 def build_model(template, values):
     validate(template, values)
     settings = json.dumps({"template": template, "values": values}, allow_nan=False)
@@ -995,6 +1051,12 @@ def build_model(template, values):
         fdtd.set("endCriteria", "1e-4")
         boundaries = ["PML_8"] * 6
         geometry = dipole_sar
+    elif template == MRI_LOOP_COIL:
+        ET.SubElement(fdtd, "Excitation", Type="0", f0=str(MRI_FREQUENCY), fc="300000000")
+        fdtd.set("CellConstantMaterial", "1")
+        fdtd.set("endCriteria", "1e-4")
+        boundaries = ["MUR"] * 6
+        geometry = mri_loop_coil
     elif template == CYLINDRICAL_WAVE:
         f0 = values["frequency"] * 1e9
         ET.SubElement(fdtd, "Excitation", Type="0", f0=str(f0), fc=str(f0 / 2))
@@ -1067,6 +1129,32 @@ def read_setup(path):
     return template, settings["values"]
 
 
+def copy_mri_phantom(target):
+    if target.is_file():
+        return
+    resource = Path("share/openEMS/resources/phantoms") / MRI_PHANTOM
+    home = Path.home()
+    candidates = sorted(home.glob(f".esim/openems/*/{resource}"))
+    executable = shutil.which("openEMS")
+    if executable:
+        candidates.insert(0, Path(executable).resolve().parent.parent / resource)
+    candidates.extend((home / "openEMS-install" / resource, Path("/usr") / resource))
+    source = next((path for path in candidates if path.is_file()), None)
+    if source is None:
+        raise FileNotFoundError(f"Could not find the openEMS head phantom {MRI_PHANTOM}.")
+    with NamedTemporaryFile(dir=target.parent, delete=False) as stream:
+        temp = Path(stream.name)
+    try:
+        shutil.copyfile(source, temp)
+        try:
+            os.link(temp, target)
+        except FileExistsError:
+            if not target.is_file():
+                raise
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def save_model(store, name, template, values, editing=None):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _-]{0,79}", name):
         raise ValueError(
@@ -1075,6 +1163,8 @@ def save_model(store, name, template, values, editing=None):
     target = store.model_path(store.folder / "models" / (name + ".xml"))
     tree = build_model(template, values)
     target.parent.mkdir(parents=True, exist_ok=True)
+    if template == MRI_LOOP_COIL:
+        copy_mri_phantom(target.with_name(MRI_PHANTOM))
     with NamedTemporaryFile(dir=target.parent, delete=False) as stream:
         temp = Path(stream.name)
     try:

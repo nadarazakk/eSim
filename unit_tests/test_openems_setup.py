@@ -1,4 +1,5 @@
 import math
+import shutil
 import sys
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -15,6 +16,8 @@ from frontEnd.OpenEMSTemplates import (
     CYLINDRICAL_WAVE,
     DIPOLE_SAR,
     HELICAL_ANTENNA,
+    MRI_LOOP_COIL,
+    MRI_PHANTOM,
     PIN_FEED_HORN,
     RECTANGULAR_WAVEGUIDE,
     SPHERE_RCS,
@@ -457,3 +460,35 @@ def test_dipole_sar_layered_phantom_and_recording(distance, frequency):
     assert float(dump.find(".//P1").get("X")) < center - 80
     assert float(dump.find(".//P2").get("X")) > center + 80
     assert [probe.get("Name") for probe in props.findall("ProbeBox")] == ["port_ut1", "port_it1"]
+
+
+def test_mri_coil_saves_and_archives_phantom_dependency(tmp_path, monkeypatch):
+    source = tmp_path / ".esim/openems/test/share/openEMS/resources/phantoms" / MRI_PHANTOM
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"phantom fixture")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    store = ProjectRuns(tmp_path / "project")
+    store.project.mkdir()
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[MRI_LOOP_COIL]}
+    model = save_model(store, "tuned", MRI_LOOP_COIL, dict(values, capacitance=6.2))
+    assert read_setup(model)[1]["capacitance"] == 6.2
+    tree = ET.parse(model)
+    assert float(tree.find("FDTD/Excitation").get("f0")) == 298e6
+    props = tree.find(".//Properties")
+    capacitors = [element for element in props.findall("LumpedElement") if "C" in element.attrib]
+    assert sum(len(cap.findall(".//Box")) for cap in capacitors) == 3
+    assert all(float(cap.get("C")) == pytest.approx(6.2e-12) for cap in capacitors)
+    assert props.find("DiscMaterial/DiscFile").get("File") == MRI_PHANTOM
+    assert {dump.get("Name") for dump in props.findall("DumpBox")} == {
+        "Hf_xy", "Hf_xz", "SAR_xy", "SAR_xz",
+    }
+    _, archived = store.prepare(model, tree)
+    assert archived.with_name(MRI_PHANTOM).read_bytes() == source.read_bytes()
+
+
+def test_mri_coil_missing_phantom_error_names_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "is_file", lambda self: False)
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[MRI_LOOP_COIL]}
+    with pytest.raises(FileNotFoundError, match=r"phantom_head_298MHz\.h5"):
+        save_model(ProjectRuns(tmp_path), "missing", MRI_LOOP_COIL, values)
