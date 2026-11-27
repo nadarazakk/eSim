@@ -10,7 +10,12 @@ from frontEnd.OpenEMSTemplates import TEMPLATES, read_setup, save_model
 
 
 @pytest.mark.parametrize(
-    "template,parameter", [("Parallel Plate Waveguide", "gap"), ("Microstrip Notch Filter", "stub")]
+    "template,parameter",
+    [
+        ("Parallel Plate Waveguide", "gap"),
+        ("Microstrip Notch Filter", "stub"),
+        ("Simple Patch Antenna", "width"),
+    ],
 )
 def test_edit_generate_and_archive(tmp_path, template, parameter):
     store = ProjectRuns(tmp_path)

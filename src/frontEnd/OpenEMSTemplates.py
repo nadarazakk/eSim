@@ -11,6 +11,7 @@ from xml.etree import ElementTree as ET
 GEOMETRY = "Geometry & Materials"
 EXCITATION = "Excitation & Ports"
 SIMULATION = "Simulation Settings"
+PATCH_ANTENNA = "Simple Patch Antenna"
 
 # key, tab, label with unit, default, minimum, maximum
 TEMPLATES = {
@@ -28,6 +29,21 @@ TEMPLATES = {
         ("frequency", EXCITATION, "Maximum frequency (GHz)", 7.0, 2.0, 12.0),
         ("steps", SIMULATION, "Maximum time steps", 60000, 1000, 200000),
     ],
+    PATCH_ANTENNA: [
+        ("width", GEOMETRY, "Patch width in X (mm)", 32.0, 5.0, 80.0),
+        ("length", GEOMETRY, "Patch length in Y (mm)", 40.0, 5.0, 80.0),
+        ("substrate_width", GEOMETRY, "Substrate width in X (mm)", 60.0, 10.0, 100.0),
+        ("substrate_length", GEOMETRY, "Substrate length in Y (mm)", 60.0, 10.0, 100.0),
+        ("height", GEOMETRY, "Substrate thickness (mm)", 1.524, 0.2, 5.0),
+        ("epsilon", GEOMETRY, "Substrate relative permittivity", 3.38, 1.0, 10.0),
+        ("loss_tangent", GEOMETRY, "Substrate loss tangent at center frequency", 0.001, 0.0, 0.1),
+        ("feed_x", EXCITATION, "Feed X offset from patch center (mm)", -6.0, -40.0, 40.0),
+        ("feed_y", EXCITATION, "Feed Y offset from patch center (mm)", 0.0, -40.0, 40.0),
+        ("resistance", EXCITATION, "Feed resistance (Ω)", 50.0, 1.0, 500.0),
+        ("frequency", EXCITATION, "Gaussian center frequency (GHz)", 2.0, 1.0, 6.0),
+        ("cutoff", EXCITATION, "Gaussian 20 dB bandwidth (±GHz)", 1.0, 0.1, 3.0),
+        ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
+    ],
 }
 
 
@@ -42,6 +58,19 @@ def validate(template, values):
             or (isinstance(default, int) and type(value) is not int)
         ):
             raise ValueError(f"{label} must be between {minimum} and {maximum}.")
+    if template == PATCH_ANTENNA:
+        if (
+            values["width"] >= values["substrate_width"]
+            or values["length"] >= values["substrate_length"]
+        ):
+            raise ValueError("The substrate must be wider and longer than the patch.")
+        if (
+            abs(values["feed_x"]) >= values["width"] / 2
+            or abs(values["feed_y"]) >= values["length"] / 2
+        ):
+            raise ValueError("The feed must be inside the patch.")
+        if values["cutoff"] > values["frequency"]:
+            raise ValueError("Gaussian bandwidth must not exceed the center frequency.")
 
 
 def series(start, stop, cells):
@@ -138,6 +167,54 @@ def notch_filter(props, p):
     return x, y, z
 
 
+def patch_antenna(props, p):
+    # All geometry is in mm. Surround the finite ground and substrate with air.
+    width, length = p["width"] / 2, p["length"] / 2
+    board_x, board_y = p["substrate_width"] / 2, p["substrate_length"] / 2
+    height = p["height"]
+    feed_x, feed_y = p["feed_x"], p["feed_y"]
+    wavelength = 299.792458 / (p["frequency"] + p["cutoff"])
+    spacing = wavelength / (20 * math.sqrt(p["epsilon"]))
+    air = max(20, 299.792458 / (4 * p["frequency"]))
+    axes = [
+        grid_axis(
+            [-board_x - air, -board_x, -width, feed_x, width, board_x, board_x + air], spacing
+        ),
+        grid_axis(
+            [-board_y - air, -board_y, -length, feed_y, length, board_y, board_y + air], spacing
+        ),
+        grid_axis([-air, 0], spacing)[:-1]
+        + series(0, height, 4)
+        + grid_axis([height, height + air], spacing)[1:],
+    ]
+
+    substrate = ET.SubElement(props, "Material", Name="substrate")
+    vacuum_permittivity = 8.8541878128e-12
+    angular_frequency = 2 * math.pi * p["frequency"] * 1e9
+    conductivity = angular_frequency * vacuum_permittivity * p["epsilon"] * p["loss_tangent"]
+    ET.SubElement(substrate, "Property", Epsilon=str(p["epsilon"]), Kappa=str(conductivity))
+    box(substrate, [-board_x, -board_y, 0], [board_x, board_y, height])
+    ground = ET.SubElement(props, "Metal", Name="ground")
+    box(ground, [-board_x, -board_y, 0], [board_x, board_y, 0], 10)
+    patch = ET.SubElement(props, "Metal", Name="patch")
+    box(patch, [-width, -length, height], [width, length, height], 10)
+
+    start, stop = [feed_x, feed_y, 0], [feed_x, feed_y, height]
+    resistor = ET.SubElement(
+        props, "LumpedElement", Name="port_resist_1", Direction="2", Caps="1",
+        R=str(p["resistance"]),
+    )
+    box(resistor, start, stop, 5)
+    source = ET.SubElement(props, "Excitation", Name="port_excite_1", Type="0", Excite="0,0,-1")
+    box(source, start, stop, 5)
+    voltage = ET.SubElement(props, "ProbeBox", Name="port_ut1", Type="0", Weight="-1")
+    box(voltage, start, stop, 5)
+    current = ET.SubElement(props, "ProbeBox", Name="port_it1", Type="1", Weight="1", NormDir="2")
+    midpoint = [feed_x, feed_y, height / 2]
+    box(current, midpoint, midpoint, 5)
+    return axes
+
+
 def build_model(template, values):
     validate(template, values)
     settings = json.dumps({"template": template, "values": values}, allow_nan=False)
@@ -153,10 +230,19 @@ def build_model(template, values):
     if plate:
         ET.SubElement(fdtd, "Excitation", Type="1", f0=str(values["frequency"] * 1e6))
         boundaries = ["PMC", "PMC", "PEC", "PEC", "MUR", "MUR"]
+        geometry = waveguide
+    elif template == PATCH_ANTENNA:
+        ET.SubElement(
+            fdtd, "Excitation", Type="0", f0=str(values["frequency"] * 1e9),
+            fc=str(values["cutoff"] * 1e9),
+        )
+        boundaries = ["MUR"] * 6
+        geometry = patch_antenna
     else:
         center = str(values["frequency"] * 0.5e9)
         ET.SubElement(fdtd, "Excitation", Type="0", f0=center, fc=center)
         boundaries = ["PML_8", "PML_8", "MUR", "MUR", "PEC", "MUR"]
+        geometry = notch_filter
     ET.SubElement(
         fdtd,
         "BoundaryCond",
@@ -165,7 +251,7 @@ def build_model(template, values):
     csx = ET.SubElement(root, "ContinuousStructure", CoordSystem="0")
     grid = ET.SubElement(csx, "RectilinearGrid", DeltaUnit="1" if plate else "0.001")
     props = ET.SubElement(csx, "Properties")
-    axes = waveguide(props, values) if plate else notch_filter(props, values)
+    axes = geometry(props, values)
     for axis, points in zip("XYZ", axes):
         ET.SubElement(grid, axis + "Lines", Qty=str(len(points))).text = ",".join(map(str, points))
     ET.indent(root)
