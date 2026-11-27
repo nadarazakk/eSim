@@ -25,6 +25,7 @@ HELICAL_ANTENNA = "Helical Antenna"
 CRLH_EXTRACTION = "CRLH Parameter Extraction"
 SPHERE_RCS = "Metal Sphere Radar Cross Section"
 UWB_RADAR = "UWB Radar — Delay and Fidelity"
+DIPOLE_SAR = "Dipole Antenna Exposure & SAR"
 # Tutorial centre frequency and channel half-bandwidth, in GHz.
 UWB_CHANNELS = {
     1: (3.5, 0.25), 2: (4.0, 0.25), 3: (4.5, 0.25),
@@ -171,6 +172,11 @@ TEMPLATES = {
         ("size", GEOMETRY, "Monopole size (mm)", 14.0, 4.0, 18.0),
         ("gap", GEOMETRY, "Feed gap from ground edge (mm)", 0.62, 0.1, 5.0),
         ("channel", EXCITATION, "UWB channel", 4, min(UWB_CHANNELS), max(UWB_CHANNELS)),
+        ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
+    ],
+    DIPOLE_SAR: [
+        ("frequency", EXCITATION, "Dipole frequency (GHz)", 1.0, 0.5, 2.0),
+        ("distance", GEOMETRY, "Distance from dipole to phantom surface (mm)", 20.0, 5.0, 120.0),
         ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
     ],
 }
@@ -894,6 +900,58 @@ def uwb_monopole(props, p):
     return axes
 
 
+def dipole_sar(props, p):
+    frequency, distance = p["frequency"], p["distance"]
+    half_length = 0.24 * LIGHT_SPEED_MM_PER_NS / frequency
+    fine = 2.5
+    gap = fine / 2
+    dipole = ET.SubElement(props, "Metal", Name="dipole")
+    box(dipole, [0, 0, -half_length], [0, 0, -gap], 1)
+    box(dipole, [0, 0, gap], [0, 0, half_length], 1)
+    lumped_feed(props, 50, [0, 0, -gap], [0, 0, gap], 2, 5)
+
+    center = distance + 80
+    layers = (
+        ("skin", (80, 100, 100), 50, 0.65, 1100),
+        ("headbone", (75, 95, 95), 13, 0.1, 2000),
+        ("brain", (65, 85, 85), 60, 0.7, 1040),
+    )
+    for priority, (name, radii, epsilon, conductivity, density) in enumerate(layers, 10):
+        tissue = ET.SubElement(props, "Material", Name=name)
+        ET.SubElement(tissue, "Property", Epsilon=str(epsilon), Kappa=str(conductivity),
+                      Density=str(density))
+        sphere = ET.SubElement(ET.SubElement(tissue, "Primitives"), "Sphere",
+                               Radius="1", Priority=str(priority))
+        ET.SubElement(sphere, "Center", X="0", Y="0", Z="0")
+        transform = ET.SubElement(sphere, "Transformation")
+        ET.SubElement(transform, "Scale3", Argument=",".join(map(str, radii)))
+        ET.SubElement(transform, "Translate", Argument=f"{center},0,0")
+
+    # Raw electric field and material data for mass-averaged SAR in Level 4.
+    sar = ET.SubElement(props, "DumpBox", Name="SAR", DumpType="29", FileType="1", DumpMode="2")
+    ET.SubElement(sar, "FD_Samples").text = str(frequency * 1e9)
+    lower, upper = [center - 130, -120, -120], [center + 100, 120, 120]
+    box(sar, lower, upper)
+
+    x_edges = [0, *(center + sign * layer[1][0] for layer in layers for sign in (-1, 1))]
+    y_edges = [-100, -95, -85, 0, 85, 95, 100]
+    z_edges = [edge for edge in y_edges if abs(abs(edge) - half_length) >= fine / 5]
+    z_edges += [-half_length, -gap, gap, half_length]
+    coarse = LIGHT_SPEED_MM_PER_NS / (30 * frequency)
+    axes = []
+    for edges, lo, hi, start, stop in zip(
+        (x_edges, y_edges, z_edges), lower, upper, (-200, -250, -250), (350, 250, 250)
+    ):
+        recording_edges = [edge for edge in (lo, hi)
+                           if all(abs(edge - point) >= fine / 5 for point in edges)]
+        core = grid_axis(sorted(edges + recording_edges), fine)
+        start = min(start, core[0] - 11 * coarse)
+        stop = max(stop, core[-1] + 11 * coarse)
+        axes.append(grid_axis([start, core[0]], coarse)[:-1]
+                    + core + grid_axis([core[-1], stop], coarse)[1:])
+    return axes
+
+
 def build_model(template, values):
     validate(template, values)
     settings = json.dumps({"template": template, "values": values}, allow_nan=False)
@@ -931,6 +989,12 @@ def build_model(template, values):
         fdtd.set("OverSampling", "20")
         boundaries = ["PML_8"] * 6
         geometry = uwb_monopole
+    elif template == DIPOLE_SAR:
+        ET.SubElement(fdtd, "Excitation", Type="0", f0="0", fc=str(values["frequency"] * 1.5e9))
+        fdtd.set("CellConstantMaterial", "1")
+        fdtd.set("endCriteria", "1e-4")
+        boundaries = ["PML_8"] * 6
+        geometry = dipole_sar
     elif template == CYLINDRICAL_WAVE:
         f0 = values["frequency"] * 1e9
         ET.SubElement(fdtd, "Excitation", Type="0", f0=str(f0), fc=str(f0 / 2))

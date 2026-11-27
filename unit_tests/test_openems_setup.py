@@ -13,6 +13,7 @@ from frontEnd.OpenEMSTemplates import (
     CONICAL_HORN,
     CRLH_EXTRACTION,
     CYLINDRICAL_WAVE,
+    DIPOLE_SAR,
     HELICAL_ANTENNA,
     PIN_FEED_HORN,
     RECTANGULAR_WAVEGUIDE,
@@ -43,6 +44,7 @@ from frontEnd.OpenEMSTemplates import (
         (CRLH_EXTRACTION, "top_gap", 5.5),
         (SPHERE_RCS, "radius", 250.0),
         (UWB_RADAR, "channel", 1),
+        (DIPOLE_SAR, "distance", 35.0),
     ],
 )
 def test_edit_generate_and_archive(tmp_path, template, parameter, value):
@@ -429,3 +431,29 @@ def test_uwb_rejects_unlisted_channel():
     values = {key: default for key, _, _, default, _, _ in TEMPLATES[UWB_RADAR]}
     with pytest.raises(ValueError, match="Select UWB channel"):
         build_model(UWB_RADAR, dict(values, channel=6))
+
+
+@pytest.mark.parametrize("distance,frequency", [(20.0, 1.0), (35.0, 1.2)])
+def test_dipole_sar_layered_phantom_and_recording(distance, frequency):
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[DIPOLE_SAR]}
+    model = build_model(DIPOLE_SAR, dict(values, distance=distance, frequency=frequency))
+    assert model.find("FDTD").get("CellConstantMaterial") == "1"
+    props = model.find(".//Properties")
+    center = distance + 80
+    for tissue, radii, density, priority in (
+        ("skin", "80,100,100", "1100", "10"),
+        ("headbone", "75,95,95", "2000", "11"),
+        ("brain", "65,85,85", "1040", "12"),
+    ):
+        material = props.find(f"Material[@Name='{tissue}']")
+        assert material.find("Property").get("Density") == density
+        sphere = material.find(".//Sphere")
+        assert sphere.get("Priority") == priority
+        assert sphere.find("Transformation/Scale3").get("Argument") == radii
+        assert sphere.find("Transformation/Translate").get("Argument") == f"{center},0,0"
+    dump = props.find("DumpBox[@Name='SAR']")
+    assert (dump.get("DumpType"), dump.get("DumpMode"), dump.get("FileType")) == ("29", "2", "1")
+    assert float(dump.findtext("FD_Samples")) == frequency * 1e9
+    assert float(dump.find(".//P1").get("X")) < center - 80
+    assert float(dump.find(".//P2").get("X")) > center + 80
+    assert [probe.get("Name") for probe in props.findall("ProbeBox")] == ["port_ut1", "port_it1"]
