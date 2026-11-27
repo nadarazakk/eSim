@@ -11,6 +11,7 @@ from frontEnd.OpenEMSTemplates import (
     BENT_PATCH,
     CIRCULAR_WAVEGUIDE,
     CYLINDRICAL_WAVE,
+    PIN_FEED_HORN,
     RECTANGULAR_WAVEGUIDE,
     STRIPLINE_TRANSITION,
     TEMPLATES,
@@ -31,6 +32,7 @@ from frontEnd.OpenEMSTemplates import (
         (CIRCULAR_WAVEGUIDE, "radial_spacing", 15.0),
         (CYLINDRICAL_WAVE, "resolution", 15.0),
         (BENT_PATCH, "radius", 65.0),
+        (PIN_FEED_HORN, "pin_length", 6.5),
     ],
 )
 def test_edit_generate_and_archive(tmp_path, template, parameter, value):
@@ -252,3 +254,47 @@ def test_invalid_bent_patch(changes):
     values = {key: default for key, _, _, default, _, _ in TEMPLATES[BENT_PATCH]}
     with pytest.raises(ValueError):
         build_model(BENT_PATCH, {**values, **changes})
+
+
+@pytest.mark.parametrize("changes,message", [
+    ({"f_min": 20.0}, "lower band edge"),
+    ({"f_ref": 9.0}, "within the simulation band"),
+    ({"width": 9.0}, "TE₁₀ cutoff"),
+    ({"width": 10.0}, "entire pin inside"),
+    ({"pin_length": 1.0}, "pin length"),
+    ({"pin_length": 10.0}, "pin length"),
+])
+def test_invalid_pin_feed_horn(changes, message):
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[PIN_FEED_HORN]}
+    with pytest.raises(ValueError, match=message):
+        build_model(PIN_FEED_HORN, {**values, **changes})
+
+
+@pytest.mark.parametrize("pin_length", [5.5, 6.5])
+def test_pin_feed_horn_geometry_and_recording_surface(pin_length):
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[PIN_FEED_HORN]}
+    model = build_model(PIN_FEED_HORN, dict(values, pin_length=pin_length))
+    assert list(model.find("FDTD/BoundaryCond").attrib.values()) == ["PML_8"] * 6
+    props = model.find(".//Properties")
+    horn = props.find("Metal[@Name='horn']/Primitives")
+    assert len(horn.findall("Box")) == 5
+    aperture = [tuple(map(float, v.text.split(","))) for v in horn.findall("Polyhedron/Vertex")[8:12]]
+    assert all(z == values["length"] for _, _, z in aperture)
+    assert math.degrees(math.atan((aperture[1][0] - 10) / values["length"])) == pytest.approx(20)
+    pin = props.find("Metal[@Name='pin']//Box")
+    assert float(pin.find("P2").get("Y")) == pin_length - 5
+    z1, z2 = (float(pin.find(f"P{i}").get("Z")) for i in (1, 2))
+    back_short = 299.792458 / (4 * math.sqrt(15**2 - (299.792458 / 40)**2))
+    assert (z1 + z2) / 2 == pytest.approx(-50 + back_short)
+    voltage = props.find("ProbeBox[@Name='port_ut1']//Box")
+    assert all(voltage.find(tag).get("X") == "0.0" for tag in ("P1", "P2"))
+    current = props.find("ProbeBox[@Name='port_it1']")
+    assert current.get("NormDir") == "1"
+    assert float(current.find(".//P2").get("Z")) - float(current.find(".//P1").get("Z")) == 1
+    for field in "EH":
+        faces = props.findall(f"DumpBox[@Name='nf2ff_{field}']//Box")
+        assert len(faces) == 6
+        for index, axis in enumerate("XYZ"):
+            mesh = list(map(float, model.findtext(f".//{axis}Lines").split(",")))
+            assert float(faces[index * 2].find("P1").get(axis)) == mesh[9]
+            assert float(faces[index * 2 + 1].find("P2").get(axis)) == mesh[-10]

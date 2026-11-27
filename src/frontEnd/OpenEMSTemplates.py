@@ -19,6 +19,10 @@ BENT_SUBSTRATE_LENGTH = 90.0
 RECTANGULAR_WAVEGUIDE = "Rectangular Waveguide"
 CIRCULAR_WAVEGUIDE = "Circular Waveguide"
 CYLINDRICAL_WAVE = "2D Cylindrical Wave"
+PIN_FEED_HORN = "Horn Antenna with Coaxial Pin Feed"
+HORN_FEED_LENGTH = 50.0  # mm
+HORN_PIN_HALF_WIDTH = 0.5
+HORN_PORT_GAP = 1.0
 RADIAL_SPLIT_DIVISORS = (32, 16, 8, 4, 2)
 LIGHT_SPEED_MM_PER_NS = 299.792458
 TE11_ROOT = 1.84118378134  # First positive zero of the derivative of J1.
@@ -104,6 +108,18 @@ TEMPLATES = {
         ("resolution", SIMULATION, "Radial and axial mesh spacing (mm)", 10.0, 5.0, 40.0),
         ("steps", SIMULATION, "Maximum time steps", 100000, 1000, 200000),
     ],
+    PIN_FEED_HORN: [
+        ("width", GEOMETRY, "Feed waveguide width (mm)", 20.0, 5.0, 35.0),
+        ("height", GEOMETRY, "Feed waveguide height (mm)", 10.0, 3.0, 25.0),
+        ("length", GEOMETRY, "Horn axial length (mm)", 50.0, 10.0, 75.0),
+        ("angle", GEOMETRY, "Flare half-angle (degrees)", 20.0, 5.0, 35.0),
+        ("pin_length", EXCITATION, "Pin length from the waveguide wall (mm)", 5.5, 1.0, 25.0),
+        ("resistance", EXCITATION, "Feed resistance (Ω)", 50.0, 1.0, 500.0),
+        ("f_min", EXCITATION, "Lower band edge (GHz)", 10.0, 2.0, 30.0),
+        ("f_max", EXCITATION, "Upper band edge (GHz)", 20.0, 2.0, 30.0),
+        ("f_ref", EXCITATION, "Back-short reference frequency (GHz)", 15.0, 2.0, 30.0),
+        ("steps", SIMULATION, "Maximum time steps", 20000, 1000, 200000),
+    ],
 }
 
 
@@ -120,6 +136,20 @@ def validate(template, values):
             raise ValueError(f"{label} must be between {minimum} and {maximum}.")
     if template == STRIPLINE_TRANSITION and values["clearance_diameter"] <= values["via_diameter"]:
         raise ValueError("The ground-plane clearance must be wider than the via.")
+    if template == PIN_FEED_HORN:
+        reference = values["f_ref"]
+        if values["f_min"] >= values["f_max"]:
+            raise ValueError("The lower band edge must be below the upper band edge.")
+        if not values["f_min"] <= reference <= values["f_max"]:
+            raise ValueError("The back-short reference frequency must lie within the simulation band.")
+        cutoff = LIGHT_SPEED_MM_PER_NS / (2 * values["width"])
+        if reference <= cutoff:
+            raise ValueError(f"The reference frequency must exceed the TE₁₀ cutoff ({cutoff:.3f} GHz).")
+        if not HORN_PORT_GAP < values["pin_length"] < values["height"]:
+            raise ValueError("The pin length must exceed the port gap and fit below the opposite wall.")
+        spacing = horn_back_short(reference, cutoff)
+        if not HORN_PIN_HALF_WIDTH < spacing < HORN_FEED_LENGTH - HORN_PIN_HALF_WIDTH:
+            raise ValueError("The back-short spacing must keep the entire pin inside the feed waveguide.")
     if template == PATCH_ANTENNA:
         if (
             values["width"] >= values["substrate_width"]
@@ -465,13 +495,28 @@ def lumped_feed(props, resistance, start, stop, direction, priority):
     )
     box(source, start, stop, priority)
     voltage = ET.SubElement(props, "ProbeBox", Name="port_ut1", Type="0", Weight="-1")
-    box(voltage, start, stop, priority)
+    midpoint = [(a + b) / 2 for a, b in zip(start, stop)]
+    voltage_start, voltage_stop = midpoint.copy(), midpoint.copy()
+    voltage_start[direction], voltage_stop[direction] = start[direction], stop[direction]
+    box(voltage, voltage_start, voltage_stop, priority)
     current = ET.SubElement(
         props, "ProbeBox", Name="port_it1", Type="1", Weight="1", NormDir=str(direction)
     )
-    midpoint = list(start)
-    midpoint[direction] = (start[direction] + stop[direction]) / 2
-    box(current, midpoint, midpoint, priority)
+    current_start, current_stop = list(start), list(stop)
+    current_start[direction] = current_stop[direction] = midpoint[direction]
+    box(current, current_start, current_stop, priority)
+
+
+def nf2ff_surface(props, lower, upper):
+    for field, kind in (("E", "0"), ("H", "1")):
+        dump = ET.SubElement(
+            props, "DumpBox", Name="nf2ff_" + field, DumpType=kind, FileType="1", DumpMode="1"
+        )
+        for axis in range(3):
+            for plane in (lower[axis], upper[axis]):
+                start, stop = list(lower), list(upper)
+                start[axis] = stop[axis] = plane
+                box(dump, start, stop)
 
 
 def bent_patch(props, p):
@@ -498,15 +543,7 @@ def bent_patch(props, p):
     # Record broadband E and H on a closed surface in air around the antenna.
     lower = [radius - 10, -board_angle - 10 / radius, -board_z - 10]
     upper = [outer + 10, board_angle + 10 / radius, board_z + 10]
-    for field, kind in (("E", "0"), ("H", "1")):
-        dump = ET.SubElement(
-            props, "DumpBox", Name="nf2ff_" + field, DumpType=kind, FileType="1", DumpMode="1"
-        )
-        for axis in range(3):
-            for plane in (lower[axis], upper[axis]):
-                start, stop = lower.copy(), upper.copy()
-                start[axis] = stop[axis] = plane
-                box(dump, start, stop)
+    nf2ff_surface(props, lower, upper)
 
     radial = (
         grid_axis([radius - 20, lower[0], radius], spacing)[:-1]
@@ -523,6 +560,73 @@ def bent_patch(props, p):
         [-150, lower[2], -board_z, -patch_z, 0, patch_z, board_z, upper[2], 150], spacing
     )
     return radial, angular, axial
+
+
+def horn_back_short(reference, cutoff):
+    return LIGHT_SPEED_MM_PER_NS / (4 * math.sqrt((reference - cutoff) * (reference + cutoff)))
+
+
+def horn_flare(primitives, width, height, length, spread, wall):
+    # Join inner and outer rectangular rings at the throat and aperture.
+    flare = ET.SubElement(primitives, "Polyhedron", Priority="10")
+    for x, y, z in (
+        (width, height, 0), (width + wall, height + wall, 0),
+        (width + spread, height + spread, length),
+        (width + spread + wall, height + spread + wall, length),
+    ):
+        for dx, dy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+            ET.SubElement(flare, "Vertex").text = f"{dx * x},{dy * y},{z}"
+    for i in range(4):
+        j = (i + 1) % 4
+        for face in (
+            (j, i, i + 8, j + 8),                       # Inner wall
+            (i + 4, j + 4, j + 12, i + 12),             # Outer wall
+            (i, j, j + 4, i + 4),                       # Throat rim
+            (j + 8, i + 8, i + 12, j + 12),             # Aperture rim
+        ):
+            ET.SubElement(flare, "Face").text = ",".join(map(str, face))
+
+
+def pin_feed_horn(props, p):
+    a, b, length = p["width"] / 2, p["height"] / 2, p["length"]
+    wall = 2.0
+    spread = length * math.tan(math.radians(p["angle"]))
+    back = -HORN_FEED_LENGTH
+    cutoff = LIGHT_SPEED_MM_PER_NS / (2 * p["width"])
+    pin_z = back + horn_back_short(p["f_ref"], cutoff)
+    pin = HORN_PIN_HALF_WIDTH
+    gap = -b + HORN_PORT_GAP
+    tip = -b + p["pin_length"]
+
+    horn = ET.SubElement(props, "Metal", Name="horn")
+    box(horn, [-a - wall, -b, back], [-a, b, 0], 10)
+    box(horn, [a, -b, back], [a + wall, b, 0], 10)
+    box(horn, [-a - wall, -b - wall, back], [a + wall, -b, 0], 10)
+    box(horn, [-a - wall, b, back], [a + wall, b + wall, 0], 10)
+    box(horn, [-a - wall, -b - wall, back - wall], [a + wall, b + wall, back], 10)
+    horn_flare(horn.find("Primitives"), a, b, length, spread, wall)
+    pin_metal = ET.SubElement(props, "Metal", Name="pin")
+    box(pin_metal, [-pin, gap, pin_z - pin], [pin, tip, pin_z + pin], 10)
+    lumped_feed(props, p["resistance"], [-pin, -b, pin_z - pin], [pin, gap, pin_z + pin], 1, 5)
+
+    cell = LIGHT_SPEED_MM_PER_NS / (20 * p["f_max"])
+    air = LIGHT_SPEED_MM_PER_NS / (4 * p["f_ref"])
+    outer_x, outer_y = a + spread + wall, b + spread + wall
+    lower = [-outer_x - air, -outer_y - air, back - wall - air]
+    upper = [outer_x + air, outer_y + air, length + 2 * air]
+    nf2ff_surface(props, lower, upper)
+    anchors = (
+        [-outer_x, -a - wall, -a, -pin, 0, pin, a, a + wall, outer_x],
+        [-outer_y, -b - wall, -b, gap, tip, b, b + wall, outer_y],
+        [back - wall, back, pin_z - pin, pin_z, pin_z + pin, 0, length],
+    )
+    # Nine cells beyond each recording face, including the eight PML cells.
+    return [
+        series(lo - 9 * cell, lo, 9)[:-1]
+        + grid_axis(sorted(set([lo, *points, hi])), cell)
+        + series(hi, hi + 9 * cell, 9)[1:]
+        for lo, hi, points in zip(lower, upper, anchors)
+    ]
 
 
 def build_model(template, values):
@@ -555,15 +659,20 @@ def build_model(template, values):
         fdtd.set("MultiGrid", ",".join(str(values["radius"] / d) for d in RADIAL_SPLIT_DIVISORS))
         boundaries = ["PEC", "PML_8", "PEC", "PEC", "PEC", "PEC"]
         geometry = cylindrical_wave
-    elif template in (RECTANGULAR_WAVEGUIDE, CIRCULAR_WAVEGUIDE):
+    elif template in (RECTANGULAR_WAVEGUIDE, CIRCULAR_WAVEGUIDE, PIN_FEED_HORN):
         hz = 1e6 if circular else 1e9
         ET.SubElement(
             fdtd, "Excitation", Type="0",
             f0=str((values["f_max"] + values["f_min"]) * 0.5 * hz),
             fc=str((values["f_max"] - values["f_min"]) * 0.5 * hz),
         )
-        boundaries = ["PEC", "PEC", "PEC", "PEC", "PML_8", "PML_8"]
-        geometry = circular_waveguide if circular else rectangular_waveguide
+        if template == PIN_FEED_HORN:
+            fdtd.set("endCriteria", "1e-4")
+            boundaries = ["PML_8"] * 6
+            geometry = pin_feed_horn
+        else:
+            boundaries = ["PEC", "PEC", "PEC", "PEC", "PML_8", "PML_8"]
+            geometry = circular_waveguide if circular else rectangular_waveguide
     else:
         center = str(values["frequency"] * 0.5e9)
         ET.SubElement(fdtd, "Excitation", Type="0", f0=center, fc=center)
