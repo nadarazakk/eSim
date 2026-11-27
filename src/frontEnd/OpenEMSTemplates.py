@@ -21,6 +21,8 @@ CIRCULAR_WAVEGUIDE = "Circular Waveguide"
 CYLINDRICAL_WAVE = "2D Cylindrical Wave"
 PIN_FEED_HORN = "Horn Antenna with Coaxial Pin Feed"
 CONICAL_HORN = "Conical Horn Antenna"
+HELICAL_ANTENNA = "Helical Antenna"
+HELIX_BANDWIDTH = 0.5  # GHz
 HORN_FEED_LENGTH = 50.0  # mm
 HORN_PIN_HALF_WIDTH = 0.5
 HORN_PORT_GAP = 1.0
@@ -130,6 +132,13 @@ TEMPLATES = {
         ("f_min", EXCITATION, "Lower band edge (GHz)", 10.0, 2.0, 30.0),
         ("f_max", EXCITATION, "Upper band edge (GHz)", 20.0, 2.0, 30.0),
         ("f_ref", EXCITATION, "Reference frequency (GHz)", 15.0, 2.0, 30.0),
+        ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
+    ],
+    HELICAL_ANTENNA: [
+        ("radius", GEOMETRY, "Helix radius (mm)", 20.0, 5.0, 35.0),
+        ("pitch", GEOMETRY, "Helix pitch per turn (mm)", 30.0, 5.0, 60.0),
+        ("turns", GEOMETRY, "Helix turns", 10, 1, 20),
+        ("frequency", EXCITATION, "Gaussian centre frequency (GHz)", 2.4, 1.0, 4.0),
         ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
     ],
 }
@@ -533,10 +542,11 @@ def lumped_feed(props, resistance, start, stop, direction, priority):
     box(current, current_start, current_stop, priority)
 
 
-def nf2ff_surface(props, lower, upper, *, directions=(True,) * 6):
+def nf2ff_surface(props, lower, upper, *, directions=(True,) * 6, **attributes):
     for field, kind in (("E", "0"), ("H", "1")):
         dump = ET.SubElement(
-            props, "DumpBox", Name="nf2ff_" + field, DumpType=kind, FileType="1", DumpMode="1"
+            props, "DumpBox", Name="nf2ff_" + field, DumpType=kind, FileType="1", DumpMode="1",
+            **attributes,
         )
         for face, enabled in enumerate(directions):
             if enabled:
@@ -700,6 +710,40 @@ def conical_horn(props, p):
     return transverse, transverse, axial
 
 
+def helical_antenna(props, p):
+    radius, pitch, turns = p["radius"], p["pitch"], p["turns"]
+    feed_height = 3
+    tip = feed_height + pitch * turns
+    wavelength = round(LIGHT_SPEED_MM_PER_NS / p["frequency"])
+    ground_radius = wavelength / 2
+    wire = ET.SubElement(props, "Metal", Name="helix")
+    curve = ET.SubElement(ET.SubElement(wire, "Primitives"), "Curve", Priority="10")
+    segments_per_turn = 20
+    for i in range(turns * segments_per_turn + 1):
+        angle = math.tau * (i % segments_per_turn) / segments_per_turn
+        ET.SubElement(
+            curve, "Vertex", X=str(radius * math.cos(angle)), Y=str(radius * math.sin(angle)),
+            Z=str(feed_height + pitch * (i / segments_per_turn)),
+        )
+    ground = ET.SubElement(props, "Metal", Name="ground")
+    cylinder(ground, ground_radius, -0.1, 0.1, 10)
+    lumped_feed(props, 120, [radius, 0, 0], [radius, 0, feed_height], 2, 5)
+
+    spacing = LIGHT_SPEED_MM_PER_NS / (20 * (p["frequency"] + HELIX_BANDWIDTH))
+    fine = min(3, spacing)
+    air = wavelength / 4
+    side, front = ground_radius + air, tip + air
+    nf2ff_surface(props, [-side, -side, -air], [side, side, front],
+                  OptResolution=",".join([str(wavelength / 15)] * 3))
+    core = grid_axis([-radius, 0, radius], fine)
+    left = grid_axis([-side - spacing, -side, -ground_radius, -radius], spacing)
+    transverse = left[:-1] + core + [-position for position in reversed(left[:-1])]
+    axial = (grid_axis([-air - spacing, -air, 0], spacing)[:-1]
+             + grid_axis([0, feed_height, tip], fine)
+             + grid_axis([tip, front, front + 9 * spacing], spacing)[1:])
+    return transverse, transverse, axial
+
+
 def build_model(template, values):
     validate(template, values)
     settings = json.dumps({"template": template, "values": values}, allow_nan=False)
@@ -724,6 +768,12 @@ def build_model(template, values):
         )
         boundaries = ["MUR"] * 6
         geometry = bent_patch if template == BENT_PATCH else patch_antenna
+    elif template == HELICAL_ANTENNA:
+        ET.SubElement(fdtd, "Excitation", Type="0", f0=str(values["frequency"] * 1e9),
+                      fc=str(HELIX_BANDWIDTH * 1e9))
+        fdtd.set("endCriteria", "1e-4")
+        boundaries = ["MUR"] * 5 + ["PML_8"]
+        geometry = helical_antenna
     elif template == CYLINDRICAL_WAVE:
         f0 = values["frequency"] * 1e9
         ET.SubElement(fdtd, "Excitation", Type="0", f0=str(f0), fc=str(f0 / 2))

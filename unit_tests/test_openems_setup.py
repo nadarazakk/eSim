@@ -12,6 +12,7 @@ from frontEnd.OpenEMSTemplates import (
     CIRCULAR_WAVEGUIDE,
     CONICAL_HORN,
     CYLINDRICAL_WAVE,
+    HELICAL_ANTENNA,
     PIN_FEED_HORN,
     RECTANGULAR_WAVEGUIDE,
     STRIPLINE_TRANSITION,
@@ -35,6 +36,7 @@ from frontEnd.OpenEMSTemplates import (
         (BENT_PATCH, "radius", 65.0),
         (PIN_FEED_HORN, "pin_length", 6.5),
         (CONICAL_HORN, "angle", 25.0),
+        (HELICAL_ANTENNA, "turns", 8),
     ],
 )
 def test_edit_generate_and_archive(tmp_path, template, parameter, value):
@@ -346,3 +348,19 @@ def test_conical_horn_profile_port_and_recording_surface(angle):
         for face, axis in zip(faces, "XXYYZ"):
             assert face.find("P1").get(axis) == face.find("P2").get(axis)
         assert float(faces[-1].find("P1").get("Z")) > values["length"]
+
+
+@pytest.mark.parametrize("turns", [1, 8, 10])
+def test_helix_has_selected_number_of_turns(turns):
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[HELICAL_ANTENNA]}
+    model = build_model(HELICAL_ANTENNA, dict(values, turns=turns))
+    points = [tuple(float(vertex.get(axis)) for axis in "XYZ")
+              for vertex in model.findall(".//Metal[@Name='helix']//Curve/Vertex")]
+    assert points[0] == (20, 0, 3)
+    assert points[-1] == (20, 0, 3 + 30 * turns)
+    assert len(points) == 20 * turns + 1
+    sweep = sum(
+        math.atan2(x1 * y2 - y1 * x2, x1 * x2 + y1 * y2)
+        for (x1, y1, _), (x2, y2, _) in zip(points, points[1:])
+    )
+    assert sweep == pytest.approx(math.tau * turns)
