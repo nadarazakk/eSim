@@ -22,6 +22,7 @@ CYLINDRICAL_WAVE = "2D Cylindrical Wave"
 PIN_FEED_HORN = "Horn Antenna with Coaxial Pin Feed"
 CONICAL_HORN = "Conical Horn Antenna"
 HELICAL_ANTENNA = "Helical Antenna"
+CRLH_EXTRACTION = "CRLH Parameter Extraction"
 HELIX_BANDWIDTH = 0.5  # GHz
 HORN_FEED_LENGTH = 50.0  # mm
 HORN_PIN_HALF_WIDTH = 0.5
@@ -141,6 +142,16 @@ TEMPLATES = {
         ("frequency", EXCITATION, "Gaussian centre frequency (GHz)", 2.4, 1.0, 4.0),
         ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
     ],
+    CRLH_EXTRACTION: [
+        ("length", GEOMETRY, "Unit-cell length (mm)", 14.0, 5.0, 30.0),
+        ("width", GEOMETRY, "Unit-cell width (mm)", 4.0, 1.0, 10.0),
+        ("top_gap", GEOMETRY, "Top gap width (mm)", 4.7, 0.5, 15.0),
+        ("bottom_gap", GEOMETRY, "Bottom gap width (mm)", 1.95, 0.5, 15.0),
+        ("stub", GEOMETRY, "Stub length (mm)", 7.8, 1.0, 20.0),
+        ("f_min", EXCITATION, "Lower band edge (GHz)", 0.8, 0.1, 12.0),
+        ("f_max", EXCITATION, "Upper band edge (GHz)", 6.0, 0.2, 12.0),
+        ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
+    ],
 }
 
 
@@ -157,6 +168,11 @@ def validate(template, values):
             raise ValueError(f"{label} must be between {minimum} and {maximum}.")
     if template == STRIPLINE_TRANSITION and values["clearance_diameter"] <= values["via_diameter"]:
         raise ValueError("The ground-plane clearance must be wider than the via.")
+    if template == CRLH_EXTRACTION:
+        if max(values["top_gap"], values["bottom_gap"]) >= values["length"]:
+            raise ValueError("Both gaps must be smaller than the unit-cell length.")
+        if values["f_min"] >= values["f_max"]:
+            raise ValueError("The lower band edge must be below the upper band edge.")
     if template in (PIN_FEED_HORN, CONICAL_HORN):
         reference = values["f_ref"]
         if values["f_min"] >= values["f_max"]:
@@ -242,13 +258,14 @@ def box(prop, start, stop, priority=0):
         ET.SubElement(shape, tag, dict(zip("XYZ", map(str, coords))))
 
 
-def cylinder(prop, radius, z_start, z_stop, priority):
+def cylinder(prop, radius, z_start, z_stop, priority, *, center=(0, 0)):
     primitives = prop.find("Primitives")
     if primitives is None:
         primitives = ET.SubElement(prop, "Primitives")
     shape = ET.SubElement(primitives, "Cylinder", Radius=str(radius), Priority=str(priority))
-    ET.SubElement(shape, "P1", X="0", Y="0", Z=str(z_start))
-    ET.SubElement(shape, "P2", X="0", Y="0", Z=str(z_stop))
+    x, y = map(str, center)
+    ET.SubElement(shape, "P1", X=x, Y=y, Z=str(z_start))
+    ET.SubElement(shape, "P2", X=x, Y=y, Z=str(z_stop))
 
 
 def waveguide(props, p):
@@ -392,24 +409,72 @@ def notch_filter(props, p):
     source = ET.SubElement(props, "Excitation", Name="port_excite_1", Type="0", Excite="0,0,-1")
     box(source, [x[10], -half, 0], [x[10], half, height])
     for port, direction in ((1, 1), (2, -1)):
-        center = min(range(len(x)), key=lambda i: abs(x[i] + direction * 100 / 3))
-        planes = [x[center - direction], x[center], x[center + direction]]
-        for suffix, pos in zip("ABC", planes):
-            probe = ET.SubElement(
-                props, "ProbeBox", Name=f"port_ut{port}{suffix}", Type="0", Weight="1"
-            )
-            box(probe, [pos, 0, height], [pos, 0, 0])
-        for suffix, left, right in zip("AB", planes, planes[1:]):
-            pos = (left + right) / 2
-            probe = ET.SubElement(
-                props,
-                "ProbeBox",
-                Name=f"port_it{port}{suffix}",
-                Type="1",
-                Weight=str(direction),
-                NormDir="0",
-            )
-            box(probe, [pos, -outer, (z[2] + z[3]) / 2], [pos, outer, (z[5] + z[6]) / 2])
+        microstrip_probes(props, port, direction, x, -direction * 100 / 3, height, outer,
+                          ((z[2] + z[3]) / 2, (z[5] + z[6]) / 2))
+    return x, y, z
+
+
+def microstrip_probes(props, port, direction, x, reference, height, outer, current_heights):
+    center = min(range(len(x)), key=lambda i: abs(x[i] - reference))
+    planes = [x[center - direction], x[center], x[center + direction]]
+    for suffix, pos in zip("ABC", planes):
+        probe = ET.SubElement(
+            props, "ProbeBox", Name=f"port_ut{port}{suffix}", Type="0", Weight="1"
+        )
+        box(probe, [pos, 0, height], [pos, 0, 0])
+    for suffix, left, right in zip("AB", planes, planes[1:]):
+        pos = (left + right) / 2
+        probe = ET.SubElement(
+            props, "ProbeBox", Name=f"port_it{port}{suffix}", Type="1",
+            Weight=str(direction), NormDir="0",
+        )
+        box(probe, [pos, -outer, current_heights[0]], [pos, outer, current_heights[1]])
+
+
+def crlh_extraction(props, p):
+    half = p["length"] / 2
+    width = p["width"] / 2
+    top_gap, bottom_end = p["top_gap"] / 2, half - p["bottom_gap"] / 2
+    stub_end, stub_half, via_radius = width + p["stub"], 0.5, 0.25
+    layers = (0, 1.524, 1.625, 1.879)
+    bottom, top = layers[-2:]
+    epsilon = 3.48
+    extent, side = half + 30, 30
+    resolution = min(1.0, LIGHT_SPEED_MM_PER_NS / (30 * p["f_max"] * math.sqrt(epsilon)))
+    outer = width + resolution / 6
+    via_y = stub_end - stub_half
+
+    x = grid_axis(sorted({-extent, -half, -bottom_end, -top_gap, -stub_half,
+                          -via_radius, 0, via_radius, stub_half, top_gap, bottom_end,
+                          half, extent}), resolution)
+    y_positive = grid_axis([0, width, outer, via_y - via_radius, via_y,
+                            via_y + via_radius, stub_end, side], resolution)
+    y = [-pos for pos in reversed(y_positive[1:])] + y_positive
+    z = grid_axis(layers[:3], resolution)[:-1] + series(bottom, top, 3)
+    z += grid_axis([top, 20], resolution)[1:]
+    for index, (low, high) in enumerate(zip(layers, layers[1:])):
+        substrate = ET.SubElement(props, "Material", Name=f"substrate_{index}")
+        ET.SubElement(substrate, "Property", Epsilon=str(epsilon))
+        box(substrate, [-extent, -side, low], [extent, side, high])
+
+    upper = ET.SubElement(props, "Metal", Name="metal_top")
+    for start, stop in ((-extent, -half), (-half, -top_gap),
+                        (top_gap, half), (half, extent)):
+        box(upper, [start, -width, top], [stop, width, top], 10)
+    lower = ET.SubElement(props, "Metal", Name="metal_bottom")
+    box(lower, [-bottom_end, -width, bottom], [bottom_end, width, bottom], 10)
+    box(lower, [-stub_half, -stub_end, bottom], [stub_half, stub_end, bottom], 10)
+    vias = ET.SubElement(props, "Metal", Name="vias")
+    for position in (-via_y, via_y):
+        cylinder(vias, via_radius, 0, bottom, 10, center=(0, position))
+
+    source = ET.SubElement(props, "Excitation", Name="port_excite_1", Type="0", Excite="0,0,-1")
+    box(source, [x[10], -width, 0], [x[10], width, top])
+    top_index = z.index(top)
+    current_heights = ((z[top_index - 1] + top) / 2, (top + z[top_index + 1]) / 2)
+    for port, direction in ((1, 1), (2, -1)):
+        microstrip_probes(props, port, direction, x, -direction * (half + 15),
+                          top, outer, current_heights)
     return x, y, z
 
 
@@ -780,7 +845,8 @@ def build_model(template, values):
         fdtd.set("MultiGrid", ",".join(str(values["radius"] / d) for d in RADIAL_SPLIT_DIVISORS))
         boundaries = ["PEC", "PML_8", "PEC", "PEC", "PEC", "PEC"]
         geometry = cylindrical_wave
-    elif template in (RECTANGULAR_WAVEGUIDE, CIRCULAR_WAVEGUIDE, PIN_FEED_HORN, CONICAL_HORN):
+    elif template in (RECTANGULAR_WAVEGUIDE, CIRCULAR_WAVEGUIDE, PIN_FEED_HORN,
+                       CONICAL_HORN, CRLH_EXTRACTION):
         hz = 1e6 if circular else 1e9
         ET.SubElement(
             fdtd, "Excitation", Type="0",
@@ -791,6 +857,9 @@ def build_model(template, values):
             fdtd.set("endCriteria", "1e-4")
             boundaries = ["PML_8"] * 6
             geometry = pin_feed_horn if template == PIN_FEED_HORN else conical_horn
+        elif template == CRLH_EXTRACTION:
+            boundaries = ["PML_8", "PML_8", "MUR", "MUR", "PEC", "PML_8"]
+            geometry = crlh_extraction
         else:
             boundaries = ["PEC", "PEC", "PEC", "PEC", "PML_8", "PML_8"]
             geometry = circular_waveguide if circular else rectangular_waveguide

@@ -11,6 +11,7 @@ from frontEnd.OpenEMSTemplates import (
     BENT_PATCH,
     CIRCULAR_WAVEGUIDE,
     CONICAL_HORN,
+    CRLH_EXTRACTION,
     CYLINDRICAL_WAVE,
     HELICAL_ANTENNA,
     PIN_FEED_HORN,
@@ -37,6 +38,7 @@ from frontEnd.OpenEMSTemplates import (
         (PIN_FEED_HORN, "pin_length", 6.5),
         (CONICAL_HORN, "angle", 25.0),
         (HELICAL_ANTENNA, "turns", 8),
+        (CRLH_EXTRACTION, "top_gap", 5.5),
     ],
 )
 def test_edit_generate_and_archive(tmp_path, template, parameter, value):
@@ -364,3 +366,22 @@ def test_helix_has_selected_number_of_turns(turns):
         for (x1, y1, _), (x2, y2, _) in zip(points, points[1:])
     )
     assert sweep == pytest.approx(math.tau * turns)
+
+
+@pytest.mark.parametrize("top_gap,bottom_gap", [(4.7, 1.95), (5.5, 2.5)])
+def test_crlh_cell_and_ports(top_gap, bottom_gap):
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[CRLH_EXTRACTION]}
+    model = build_model(CRLH_EXTRACTION, dict(values, top_gap=top_gap, bottom_gap=bottom_gap))
+    props = model.find(".//Properties")
+    top = props.findall("Metal[@Name='metal_top']//Box")
+    assert float(top[1].find("P2").get("X")) == -top_gap / 2
+    assert float(top[2].find("P1").get("X")) == top_gap / 2
+    bottom = props.find("Metal[@Name='metal_bottom']//Box")
+    assert float(bottom.find("P2").get("X")) == (values["length"] - bottom_gap) / 2
+    layers = props.findall("Material")
+    assert [float(layer.find("Property").get("Epsilon")) for layer in layers] == [3.48] * 3
+    assert [float(layer.find(".//P2").get("Z")) for layer in layers] == [1.524, 1.625, 1.879]
+    assert len(props.findall("Metal[@Name='vias']//Cylinder")) == 2
+    probes = {probe.get("Name") for probe in props.findall("ProbeBox")}
+    assert probes == {f"port_{kind}{port}{suffix}" for port in (1, 2)
+                      for kind, suffixes in (("ut", "ABC"), ("it", "AB")) for suffix in suffixes}
