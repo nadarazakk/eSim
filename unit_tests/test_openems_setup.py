@@ -19,6 +19,7 @@ from frontEnd.OpenEMSTemplates import (
     SPHERE_RCS,
     STRIPLINE_TRANSITION,
     TEMPLATES,
+    UWB_RADAR,
     build_model,
     read_setup,
     save_model,
@@ -41,6 +42,7 @@ from frontEnd.OpenEMSTemplates import (
         (HELICAL_ANTENNA, "turns", 8),
         (CRLH_EXTRACTION, "top_gap", 5.5),
         (SPHERE_RCS, "radius", 250.0),
+        (UWB_RADAR, "channel", 1),
     ],
 )
 def test_edit_generate_and_archive(tmp_path, template, parameter, value):
@@ -407,3 +409,23 @@ def test_sphere_recording_surface_is_outside_plane_wave_box():
             plane = float(face.find("P1").get(axis))
             assert plane == float(face.find("P2").get(axis))
             assert source_edge < abs(plane) <= mesh[-10]
+
+
+@pytest.mark.parametrize("channel,center,half_band", [(4, 4.0, 0.5), (1, 3.5, 0.25)])
+def test_uwb_channel_controls_pulse_and_recordings(channel, center, half_band):
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[UWB_RADAR]}
+    model = build_model(UWB_RADAR, dict(values, channel=channel))
+    fdtd = model.find("FDTD")
+    pulse = fdtd.find("Excitation")
+    assert float(pulse.get("f0")) == center * 1e9
+    assert float(pulse.get("fc")) == pytest.approx(half_band * 1e9 / 0.3925)
+    assert fdtd.get("OverSampling") == "20"
+    props = model.find(".//Properties")
+    assert [probe.get("Name") for probe in props.findall("ProbeBox")] == ["port_ut1", "port_it1"]
+    assert all(len(props.findall(f"DumpBox[@Name='nf2ff_{field}']//Box")) == 6 for field in "EH")
+
+
+def test_uwb_rejects_unlisted_channel():
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[UWB_RADAR]}
+    with pytest.raises(ValueError, match="Select UWB channel"):
+        build_model(UWB_RADAR, dict(values, channel=6))

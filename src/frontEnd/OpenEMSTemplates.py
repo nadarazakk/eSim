@@ -24,6 +24,13 @@ CONICAL_HORN = "Conical Horn Antenna"
 HELICAL_ANTENNA = "Helical Antenna"
 CRLH_EXTRACTION = "CRLH Parameter Extraction"
 SPHERE_RCS = "Metal Sphere Radar Cross Section"
+UWB_RADAR = "UWB Radar — Delay and Fidelity"
+# Tutorial centre frequency and channel half-bandwidth, in GHz.
+UWB_CHANNELS = {
+    1: (3.5, 0.25), 2: (4.0, 0.25), 3: (4.5, 0.25),
+    4: (4.0, 0.50), 5: (6.5, 0.25), 7: (6.5, 0.50),
+}
+UWB_GAUSSIAN_FACTOR = 0.3925
 HELIX_BANDWIDTH = 0.5  # GHz
 HORN_FEED_LENGTH = 50.0  # mm
 HORN_PIN_HALF_WIDTH = 0.5
@@ -160,6 +167,12 @@ TEMPLATES = {
         ("f_max", EXCITATION, "Upper band edge (MHz)", 1000.0, 20.0, 1500.0),
         ("steps", SIMULATION, "Maximum time steps", 10000, 1000, 100000),
     ],
+    UWB_RADAR: [
+        ("size", GEOMETRY, "Monopole size (mm)", 14.0, 4.0, 18.0),
+        ("gap", GEOMETRY, "Feed gap from ground edge (mm)", 0.62, 0.1, 5.0),
+        ("channel", EXCITATION, "UWB channel", 4, min(UWB_CHANNELS), max(UWB_CHANNELS)),
+        ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
+    ],
 }
 
 
@@ -181,6 +194,11 @@ def validate(template, values):
             raise ValueError("Both gaps must be smaller than the unit-cell length.")
     if template in (CRLH_EXTRACTION, SPHERE_RCS) and values["f_min"] >= values["f_max"]:
         raise ValueError("The lower band edge must be below the upper band edge.")
+    if template == UWB_RADAR:
+        if values["channel"] not in UWB_CHANNELS:
+            raise ValueError("Select UWB channel 1–5 or 7.")
+        if values["size"] + values["gap"] > 18:
+            raise ValueError("The monopole and its feed gap must fit on the substrate.")
     if template in (PIN_FEED_HORN, CONICAL_HORN):
         reference = values["f_ref"]
         if values["f_min"] >= values["f_max"]:
@@ -844,6 +862,38 @@ def sphere_rcs(props, p):
     return axis, axis, axis
 
 
+def uwb_monopole(props, p):
+    half = p["size"] / 2
+    gap, height, trace = p["gap"], 0.707, 1.15
+    tip = gap + p["size"]
+    center, channel_band = UWB_CHANNELS[p["channel"]]
+    coarse = LIGHT_SPEED_MM_PER_NS / (20 * (center + channel_band / UWB_GAUSSIAN_FACTOR))
+    fine = coarse / 4
+    feed_y = -16 + fine
+    substrate = ET.SubElement(props, "Material", Name="substrate")
+    ET.SubElement(substrate, "Property", Epsilon="4")
+    box(substrate, [-16, -16, -height], [16, 18, 0], 1)
+    for name, start, stop in (
+        ("ground", [-16, -16, -height], [16, 0, -height]),
+        ("feed", [-trace, -16, 0], [trace, gap, 0]),
+        ("monopole", [-half, gap, 0], [half, tip, 0]),
+    ):
+        box(ET.SubElement(props, "Metal", Name=name), start, stop, 2)
+    lumped_feed(props, 50, [-trace, feed_y, -height], [trace, feed_y, 0], 2, 999)
+
+    cores = (
+        grid_axis([-16, -half, -trace, 0, trace, half, 16], fine),
+        grid_axis(sorted({-16, feed_y, 0, gap, tip, 18}), fine),
+        series(-height, 0, 3),
+    )
+    axes = [
+        grid_axis([low, core[0]], coarse)[:-1] + core + grid_axis([core[-1], high], coarse)[1:]
+        for core, low, high in zip(cores, (-60, -60, -46), (60, 65, 45))
+    ]
+    nf2ff_surface(props, [axis[9] for axis in axes], [axis[-10] for axis in axes])
+    return axes
+
+
 def build_model(template, values):
     validate(template, values)
     settings = json.dumps({"template": template, "values": values}, allow_nan=False)
@@ -874,6 +924,13 @@ def build_model(template, values):
         fdtd.set("endCriteria", "1e-4")
         boundaries = ["MUR"] * 5 + ["PML_8"]
         geometry = helical_antenna
+    elif template == UWB_RADAR:
+        center, channel_band = UWB_CHANNELS[values["channel"]]
+        ET.SubElement(fdtd, "Excitation", Type="0", f0=str(center * 1e9),
+                      fc=str(channel_band * 1e9 / UWB_GAUSSIAN_FACTOR))
+        fdtd.set("OverSampling", "20")
+        boundaries = ["PML_8"] * 6
+        geometry = uwb_monopole
     elif template == CYLINDRICAL_WAVE:
         f0 = values["frequency"] * 1e9
         ET.SubElement(fdtd, "Excitation", Type="0", f0=str(f0), fc=str(f0 / 2))
