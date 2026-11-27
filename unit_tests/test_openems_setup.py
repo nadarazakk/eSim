@@ -1,3 +1,4 @@
+import math
 import sys
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -7,6 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from frontEnd.OpenEMSProject import ProjectRuns
 from frontEnd.OpenEMSTemplates import (
+    CIRCULAR_WAVEGUIDE,
     RECTANGULAR_WAVEGUIDE,
     TEMPLATES,
     build_model,
@@ -22,6 +24,7 @@ from frontEnd.OpenEMSTemplates import (
         ("Microstrip Notch Filter", "stub"),
         ("Simple Patch Antenna", "width"),
         (RECTANGULAR_WAVEGUIDE, "length"),
+        (CIRCULAR_WAVEGUIDE, "radial_spacing"),
     ],
 )
 def test_edit_generate_and_archive(tmp_path, template, parameter):
@@ -82,3 +85,43 @@ def test_rectangular_waveguide_mode_and_band():
         assert voltage.find("ModeFunction").attrib == field
         current = model.find(f".//ProbeBox[@Name='port_it{port}']")
         assert current.get("Weight") == ("1" if port == 1 else "-1")
+
+
+def test_circular_waveguide_mesh_and_ports():
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[CIRCULAR_WAVEGUIDE]}
+    values.update(radius=400.0, length=1300.0, radial_spacing=20.0, angular_cells=36,
+                  axial_spacing=25.0, f_min=350.0, f_max=550.0)
+    model = build_model(CIRCULAR_WAVEGUIDE, values)
+    assert model.find("FDTD").get("CylinderCoords") == "1"
+    assert model.find("ContinuousStructure").get("CoordSystem") == "1"
+    pulse = model.find("FDTD/Excitation")
+    assert (float(pulse.get("f0")), float(pulse.get("fc"))) == (450e6, 100e6)
+    assert model.find("FDTD/BoundaryCond").get("xmax") == "PEC"
+    grid = model.find(".//RectilinearGrid")
+    assert grid.get("CoordSystem") == "1" and float(grid.get("DeltaUnit")) == 0.001
+    for axis, cells, stop in (("X", 20, 400), ("Y", 36, math.tau), ("Z", 52, 1300)):
+        lines = list(map(float, grid.findtext(axis + "Lines").split(",")))
+        assert lines == pytest.approx([stop * i / cells for i in range(cells + 1)])
+
+    props = model.find(".//Properties")
+    source, = props.findall("Excitation")
+    assert source.get("Name") == "port_excite_1"
+    electric = source.find("Weight").attrib
+    assert "rho" in electric["X"] and "cos(a)" in electric["X"]
+    assert "rho" in electric["Y"] and "sin(a)" in electric["Y"]
+    for port, sign in ((1, "1"), (2, "-1")):
+        voltage = props.find(f"ProbeBox[@Name='port_ut{port}']")
+        current = props.find(f"ProbeBox[@Name='port_it{port}']")
+        assert voltage.get("Type") == "10" and voltage.find("ModeFunction").attrib == electric
+        assert current.get("Type") == "11" and current.get("Weight") == sign
+        assert current.find("ModeFunction").get("Y") == electric["X"]
+
+
+@pytest.mark.parametrize("changes", [
+    {"radius": 0}, {"length": 0}, {"f_min": 500}, {"f_max": 250}, {"radius": 200},
+    {"radial_spacing": 0}, {"angular_cells": 12.5}, {"axial_spacing": 0},
+])
+def test_invalid_circular_waveguide(changes):
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[CIRCULAR_WAVEGUIDE]}
+    with pytest.raises(ValueError):
+        build_model(CIRCULAR_WAVEGUIDE, {**values, **changes})

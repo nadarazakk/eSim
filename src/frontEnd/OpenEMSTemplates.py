@@ -13,7 +13,9 @@ EXCITATION = "Excitation & Ports"
 SIMULATION = "Simulation Settings"
 PATCH_ANTENNA = "Simple Patch Antenna"
 RECTANGULAR_WAVEGUIDE = "Rectangular Waveguide"
+CIRCULAR_WAVEGUIDE = "Circular Waveguide"
 LIGHT_SPEED_MM_PER_NS = 299.792458
+TE11_ROOT = 1.84118378134  # First positive zero of the derivative of J1.
 
 # key, tab, label with unit, default, minimum, maximum
 TEMPLATES = {
@@ -56,6 +58,16 @@ TEMPLATES = {
         ("f_max", EXCITATION, "Upper band edge (GHz)", 26.0, 1.0, 50.0),
         ("steps", SIMULATION, "Maximum time steps", 10000, 1000, 200000),
     ],
+    CIRCULAR_WAVEGUIDE: [
+        ("radius", GEOMETRY, "Waveguide radius (mm)", 350.0, 50.0, 700.0),
+        ("length", GEOMETRY, "Waveguide length (mm)", 2000.0, 100.0, 4000.0),
+        ("f_min", EXCITATION, "TE11 lower band edge (MHz)", 300.0, 50.0, 2000.0),
+        ("f_max", EXCITATION, "TE11 upper band edge (MHz)", 500.0, 50.0, 2000.0),
+        ("radial_spacing", SIMULATION, "Maximum radial cell size (mm)", 10.0, 5.0, 50.0),
+        ("angular_cells", SIMULATION, "Cells around circumference", 50, 12, 100),
+        ("axial_spacing", SIMULATION, "Maximum axial cell size (mm)", 10.0, 5.0, 50.0),
+        ("steps", SIMULATION, "Maximum time steps", 60000, 1000, 200000),
+    ],
 }
 
 
@@ -83,17 +95,22 @@ def validate(template, values):
             raise ValueError("The feed must be inside the patch.")
         if values["cutoff"] > values["frequency"]:
             raise ValueError("Gaussian bandwidth must not exceed the center frequency.")
+    if template in (RECTANGULAR_WAVEGUIDE, CIRCULAR_WAVEGUIDE):
+        if values["f_min"] >= values["f_max"]:
+            raise ValueError("The lower band edge must be below the upper band edge.")
     if template == RECTANGULAR_WAVEGUIDE:
         m, n = values["m"], values["n"]
         if m == n == 0:
             raise ValueError("A TE mode needs at least one nonzero index.")
-        if values["f_min"] >= values["f_max"]:
-            raise ValueError("The lower band edge must be below the upper band edge.")
         cutoff = LIGHT_SPEED_MM_PER_NS / 2 * math.hypot(m / values["width"], n / values["height"])
         if values["f_min"] <= cutoff:
             raise ValueError(
                 f"The lower band edge must exceed the TE{m}{n} cutoff ({cutoff:.3f} GHz)."
             )
+    if template == CIRCULAR_WAVEGUIDE:
+        cutoff = 1000 * LIGHT_SPEED_MM_PER_NS * TE11_ROOT / (math.tau * values["radius"])
+        if values["f_min"] <= cutoff:
+            raise ValueError(f"The lower band edge must exceed the TE11 cutoff ({cutoff:.3f} MHz).")
 
 
 def series(start, stop, cells):
@@ -148,9 +165,32 @@ def rectangular_waveguide(props, p):
     hy = f"{ny}*cos({kx}*x)*sin({ky}*y)"
     electric = {"X": hy, "Y": f"-{hx}", "Z": "0"}
     magnetic = {"X": hx, "Y": hy, "Z": "0"}
+    waveguide_ports(props, (width, height), z, electric, magnetic)
+    return x, y, z
+
+
+def circular_waveguide(props, p):
+    radius, length = p["radius"], p["length"]
+    radial = series(0, radius, max(4, math.ceil(radius / p["radial_spacing"])))
+    angle = series(0, math.tau, p["angular_cells"])
+    z = series(0, length, max(32, math.ceil(length / p["axial_spacing"])))
+
+    # TE11 transverse fields in the (r, azimuth) basis. The Bessel recurrence
+    # J1(u)/u = (J0(u) + J2(u))/2 also gives the finite limit on the axis.
+    u = f"{TE11_ROOT / radius}*rho"
+    j0, j2 = f"j0({u})", f"jn(2,{u})"
+    er = f"-cos(a)*({j0}+{j2})/2"
+    ea = f"sin(a)*({j0}-{j2})/2"
+    electric = {"X": er, "Y": ea, "Z": "0"}
+    magnetic = {"X": f"-{ea}", "Y": er, "Z": "0"}
+    waveguide_ports(props, (radius, math.tau), z, electric, magnetic)
+    return radial, angle, z
+
+
+def waveguide_ports(props, cross_section, z, electric, magnetic):
     source = ET.SubElement(props, "Excitation", Name="port_excite_1", Type="0", Excite="1,1,0")
     ET.SubElement(source, "Weight", electric)
-    box(source, [0, 0, z[10]], [width, height, z[10]])
+    box(source, [0, 0, z[10]], [*cross_section, z[10]])
     for port, plane, direction in ((1, z[14], 1), (2, z[-15], -1)):
         for prefix, kind, profile, weight in (
             ("port_ut", "10", electric, 1),
@@ -160,8 +200,7 @@ def rectangular_waveguide(props, p):
                 props, "ProbeBox", Name=f"{prefix}{port}", Type=kind, Weight=str(weight)
             )
             ET.SubElement(probe, "ModeFunction", profile)
-            box(probe, [0, 0, plane], [width, height, plane])
-    return x, y, z
+            box(probe, [0, 0, plane], [*cross_section, plane])
 
 
 def notch_filter(props, p):
@@ -274,6 +313,7 @@ def build_model(template, values):
     settings = json.dumps({"template": template, "values": values}, allow_nan=False)
     root = ET.Element("openEMS", eSimSetup=settings)
     plate = template == "Parallel Plate Waveguide"
+    circular = template == CIRCULAR_WAVEGUIDE
     fdtd = ET.SubElement(
         root,
         "FDTD",
@@ -292,14 +332,15 @@ def build_model(template, values):
         )
         boundaries = ["MUR"] * 6
         geometry = patch_antenna
-    elif template == RECTANGULAR_WAVEGUIDE:
+    elif template in (RECTANGULAR_WAVEGUIDE, CIRCULAR_WAVEGUIDE):
+        hz = 1e6 if circular else 1e9
         ET.SubElement(
             fdtd, "Excitation", Type="0",
-            f0=str((values["f_max"] + values["f_min"]) * 0.5e9),
-            fc=str((values["f_max"] - values["f_min"]) * 0.5e9),
+            f0=str((values["f_max"] + values["f_min"]) * 0.5 * hz),
+            fc=str((values["f_max"] - values["f_min"]) * 0.5 * hz),
         )
         boundaries = ["PEC", "PEC", "PEC", "PEC", "PML_8", "PML_8"]
-        geometry = rectangular_waveguide
+        geometry = circular_waveguide if circular else rectangular_waveguide
     else:
         center = str(values["frequency"] * 0.5e9)
         ET.SubElement(fdtd, "Excitation", Type="0", f0=center, fc=center)
@@ -312,6 +353,11 @@ def build_model(template, values):
     )
     csx = ET.SubElement(root, "ContinuousStructure", CoordSystem="0")
     grid = ET.SubElement(csx, "RectilinearGrid", DeltaUnit="1" if plate else "0.001")
+    if circular:
+        fdtd.set("CylinderCoords", "1")
+        fdtd.set("endCriteria", "1e-4")
+        csx.set("CoordSystem", "1")
+        grid.set("CoordSystem", "1")
     props = ET.SubElement(csx, "Properties")
     axes = geometry(props, values)
     for axis, points in zip("XYZ", axes):
