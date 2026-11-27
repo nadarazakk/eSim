@@ -11,6 +11,7 @@ from xml.etree import ElementTree as ET
 GEOMETRY = "Geometry & Materials"
 EXCITATION = "Excitation & Ports"
 SIMULATION = "Simulation Settings"
+STRIPLINE_TRANSITION = "Stripline to Microstrip Line Transition"
 PATCH_ANTENNA = "Simple Patch Antenna"
 BENT_PATCH = "Bent Patch Antenna"
 BENT_SUBSTRATE_WIDTH = 80.0  # Arc length at the ground plane, in mm.
@@ -36,6 +37,16 @@ TEMPLATES = {
         ("height", GEOMETRY, "Substrate thickness (mm)", 0.254, 0.1, 1.0),
         ("epsilon", GEOMETRY, "Substrate relative permittivity", 3.66, 1.0, 10.0),
         ("frequency", EXCITATION, "Maximum frequency (GHz)", 7.0, 2.0, 12.0),
+        ("steps", SIMULATION, "Maximum time steps", 60000, 1000, 200000),
+    ],
+    STRIPLINE_TRANSITION: [
+        ("width", GEOMETRY, "Trace width (mm)", 0.5, 0.2, 2.0),
+        ("strip_thickness", GEOMETRY, "Substrate thickness on each side of the stripline (mm)", 0.512, 0.2, 2.0),
+        ("microstrip_thickness", GEOMETRY, "Microstrip substrate thickness (mm)", 0.254, 0.1, 2.0),
+        ("epsilon", GEOMETRY, "Substrate relative permittivity", 3.66, 1.0, 10.0),
+        ("via_diameter", GEOMETRY, "Via diameter (mm)", 0.5, 0.2, 2.0),
+        ("clearance_diameter", GEOMETRY, "Ground-plane clearance diameter (mm)", 1.25, 0.3, 3.0),
+        ("frequency", EXCITATION, "Maximum frequency (GHz)", 10.0, 2.0, 30.0),
         ("steps", SIMULATION, "Maximum time steps", 60000, 1000, 200000),
     ],
     PATCH_ANTENNA: [
@@ -107,6 +118,8 @@ def validate(template, values):
             or (isinstance(default, int) and type(value) is not int)
         ):
             raise ValueError(f"{label} must be between {minimum} and {maximum}.")
+    if template == STRIPLINE_TRANSITION and values["clearance_diameter"] <= values["via_diameter"]:
+        raise ValueError("The ground-plane clearance must be wider than the via.")
     if template == PATCH_ANTENNA:
         if (
             values["width"] >= values["substrate_width"]
@@ -171,6 +184,15 @@ def box(prop, start, stop, priority=0):
     shape = ET.SubElement(primitives, "Box", Priority=str(priority))
     for tag, coords in (("P1", start), ("P2", stop)):
         ET.SubElement(shape, tag, dict(zip("XYZ", map(str, coords))))
+
+
+def cylinder(prop, radius, z_start, z_stop, priority):
+    primitives = prop.find("Primitives")
+    if primitives is None:
+        primitives = ET.SubElement(prop, "Primitives")
+    shape = ET.SubElement(primitives, "Cylinder", Radius=str(radius), Priority=str(priority))
+    ET.SubElement(shape, "P1", X="0", Y="0", Z=str(z_start))
+    ET.SubElement(shape, "P2", X="0", Y="0", Z=str(z_stop))
 
 
 def waveguide(props, p):
@@ -323,6 +345,73 @@ def notch_filter(props, p):
                 NormDir="0",
             )
             box(probe, [pos, -outer, (z[2] + z[3]) / 2], [pos, outer, (z[5] + z[6]) / 2])
+    return x, y, z
+
+
+def stripline_transition(props, p):
+    half = p["width"] / 2
+    ground_z = p["strip_thickness"]
+    top = ground_z + p["microstrip_thickness"]
+    via = p["via_diameter"] / 2
+    clearance = p["clearance_diameter"] / 2
+    resolution = min(0.25, LIGHT_SPEED_MM_PER_NS / (20 * p["frequency"] * math.sqrt(p["epsilon"])))
+    # The via and the clearance set the local mesh in the plane of the traces.
+    fine = min(0.05, resolution, via / 3)
+    x_positive = (grid_axis([0, via, clearance], fine)[:-1]
+                  + grid_axis([clearance, clearance + 0.1], 2 * fine)[:-1]
+                  + grid_axis([clearance + 0.1, 10, 12.5, 15], resolution))
+    x = [-value for value in reversed(x_positive[1:])] + x_positive
+    y_edge = half + min(fine, half / 3)
+    y_local = max(y_edge, clearance) + 0.1
+    y_positive = (grid_axis([0, half, y_edge, y_local], fine)[:-1]
+                  + grid_axis([y_local, 5], resolution))
+    y = [-value for value in reversed(y_positive[1:])] + y_positive
+    microstrip_z = series(ground_z, top, max(4, math.ceil(p["microstrip_thickness"] / resolution)))
+    z = (series(-ground_z, 0, max(4, math.ceil(ground_z / resolution)))[:-1]
+         + series(0, ground_z, max(4, math.ceil(ground_z / resolution)))[:-1]
+         + microstrip_z[:-1] + grid_axis([top, 2 * ground_z + 4], resolution))
+
+    substrate = ET.SubElement(props, "Material", Name="substrate")
+    conductivity = 0.001 * math.tau * 2.45e9 * 8.8541878128e-12 * p["epsilon"]
+    ET.SubElement(substrate, "Property", Epsilon=str(p["epsilon"]), Kappa=str(conductivity))
+    box(substrate, [-15, -5, -ground_z], [15, 5, top])
+    ground = ET.SubElement(props, "Metal", Name="ground")
+    box(ground, [-15, -5, ground_z], [15, 5, ground_z], 10)
+    # Restore the substrate through the opening, with the plated via taking priority.
+    cylinder(substrate, clearance, ground_z / 2, (ground_z + top) / 2, 20)
+    metal = ET.SubElement(props, "Metal", Name="traces")
+    box(metal, [-15, -half, 0], [0, half, 0], 30)
+    box(metal, [0, -half, top], [15, half, top], 30)
+    cylinder(metal, via, 0, top, 30)
+
+    for suffix, sign in ((1, 1), (2, -1)):
+        source = ET.SubElement(
+            props, "Excitation", Name=f"port_excite_1_{suffix}", Type="0", Excite=f"0,0,{sign}"
+        )
+        box(source, [-12.5, -half, 0], [-12.5, half, sign * ground_z], 30)
+
+    # Three voltage planes and two staggered current loops allow wave separation.
+    for port, direction, voltage_paths, current_heights in (
+        (1, 1, [("1", 0, ground_z, "0.5"), ("2", 0, -ground_z, "0.5")],
+         (-ground_z / 4, ground_z / 4)),
+        (2, -1, [("", top, ground_z, "1")],
+         ((microstrip_z[-2] + top) / 2, (top + z[z.index(top) + 1]) / 2)),
+    ):
+        index = x.index(-10 * direction)
+        planes = [x[index - direction], x[index], x[index + direction]]
+        for suffix, position in zip("ABC", planes):
+            for side, start, stop, weight in voltage_paths:
+                probe = ET.SubElement(
+                    props, "ProbeBox", Name=f"port_ut{port}{suffix}{side}", Type="0", Weight=weight
+                )
+                box(probe, [position, 0, start], [position, 0, stop])
+        for suffix, left, right in zip("AB", planes, planes[1:]):
+            position = (left + right) / 2
+            probe = ET.SubElement(
+                props, "ProbeBox", Name=f"port_it{port}{suffix}", Type="1",
+                Weight=str(direction), NormDir="0",
+            )
+            box(probe, [position, -y_edge, current_heights[0]], [position, y_edge, current_heights[1]])
     return x, y, z
 
 
@@ -479,7 +568,11 @@ def build_model(template, values):
         center = str(values["frequency"] * 0.5e9)
         ET.SubElement(fdtd, "Excitation", Type="0", f0=center, fc=center)
         boundaries = ["PML_8", "PML_8", "MUR", "MUR", "PEC", "MUR"]
-        geometry = notch_filter
+        if template == STRIPLINE_TRANSITION:
+            fdtd.set("endCriteria", "1e-4")
+            geometry = stripline_transition
+        else:
+            geometry = notch_filter
     ET.SubElement(
         fdtd,
         "BoundaryCond",

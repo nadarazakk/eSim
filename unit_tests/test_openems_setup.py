@@ -12,6 +12,7 @@ from frontEnd.OpenEMSTemplates import (
     CIRCULAR_WAVEGUIDE,
     CYLINDRICAL_WAVE,
     RECTANGULAR_WAVEGUIDE,
+    STRIPLINE_TRANSITION,
     TEMPLATES,
     build_model,
     read_setup,
@@ -24,6 +25,7 @@ from frontEnd.OpenEMSTemplates import (
     [
         ("Parallel Plate Waveguide", "gap", 15.0),
         ("Microstrip Notch Filter", "stub", 15.0),
+        (STRIPLINE_TRANSITION, "via_diameter", 0.7),
         ("Simple Patch Antenna", "width", 15.0),
         (RECTANGULAR_WAVEGUIDE, "length", 15.0),
         (CIRCULAR_WAVEGUIDE, "radial_spacing", 15.0),
@@ -53,6 +55,41 @@ def test_edit_generate_and_archive(tmp_path, template, parameter, value):
     with pytest.raises(ValueError):
         save_model(store, "baseline", template, dict(updated, **{parameter: 0}), editing=model)
     assert read_setup(model) == (template, updated)
+
+
+@pytest.mark.parametrize("clearance", [0.4, 0.5])
+def test_transition_rejects_insufficient_clearance(clearance):
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[STRIPLINE_TRANSITION]}
+    with pytest.raises(ValueError, match="clearance must be wider"):
+        build_model(STRIPLINE_TRANSITION, dict(values, clearance_diameter=clearance))
+
+
+@pytest.mark.parametrize("dimensions", [(0.5, 1.25), (0.7, 1.25), (0.5, 1.5)])
+def test_transition_geometry_mesh_and_ports(dimensions):
+    diameter, opening = dimensions
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[STRIPLINE_TRANSITION]}
+    model = build_model(STRIPLINE_TRANSITION, dict(
+        values, via_diameter=diameter, clearance_diameter=opening,
+    ))
+    props = model.find(".//Properties")
+    hole = props.find("Material//Cylinder")
+    via = props.find("Metal[@Name='traces']//Cylinder")
+    ground = props.find("Metal[@Name='ground']//Box")
+    assert float(via.get("Radius")) == diameter / 2
+    assert float(hole.get("Radius")) == opening / 2
+    assert int(ground.get("Priority")) < int(hole.get("Priority")) < int(via.get("Priority"))
+    assert float(via.find("P1").get("Z")) == 0
+    assert float(via.find("P2").get("Z")) == pytest.approx(0.766)
+    mesh = list(map(float, model.findtext(".//XLines").split(",")))
+    assert all(a < b for a, b in zip(mesh, mesh[1:]))
+    assert all(edge in mesh for edge in (-opening / 2, -diameter / 2, diameter / 2, opening / 2))
+    assert [source.get("Excite") for source in props.findall("Excitation")] == ["0,0,1", "0,0,-1"]
+    probes = {probe.get("Name") for probe in props.findall("ProbeBox")}
+    assert probes == (
+        {f"port_ut1{plane}{side}" for plane in "ABC" for side in "12"}
+        | {f"port_ut2{plane}" for plane in "ABC"}
+        | {f"port_it{port}{plane}" for port in (1, 2) for plane in "AB"}
+    )
 
 
 @pytest.mark.parametrize("changes", [
