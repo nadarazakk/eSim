@@ -480,12 +480,13 @@ class ProjectExplorer(QtWidgets.QWidget):
             print("Could not save project list:", err)
 
     def openMenu(self, position):
-        indexes = self.treewidget.selectedIndexes()
-        if not indexes:
+        clicked = self.treewidget.indexAt(position)
+        if not clicked.isValid():
             return
 
         level = 0
-        index = indexes[0]
+        self.treewidget.setCurrentIndex(clicked)
+        index = clicked
         while index.parent().isValid():
             index = index.parent()
             level += 1
@@ -493,6 +494,10 @@ class ProjectExplorer(QtWidgets.QWidget):
         from frontEnd import icon_paths
         menu = QtWidgets.QMenu()
         if level == 0:
+            project_path = str(index.sibling(index.row(), 1).data())
+            simulations = menu.addAction(self.tr("openEMS Simulations..."))
+            simulations.setEnabled(os.path.isdir(project_path))
+            simulations.triggered.connect(lambda: self.openOpenEMS(project_path))
             renameProject = menu.addAction(self.tr("Rename Project"))
             renameProject.triggered.connect(self.renameProject)
             deleteproject = menu.addAction(self.tr("Remove Project"))
@@ -515,6 +520,18 @@ class ProjectExplorer(QtWidgets.QWidget):
             snapshot.triggered.connect(self.takeSnapshot)
 
         menu.exec(self.treewidget.viewport().mapToGlobal(position))
+
+    def openOpenEMS(self, project_path):
+        from frontEnd.OpenEMSDialog import OpenEMSDialog
+
+        if not hasattr(self, "openems_panels"):
+            self.openems_panels = {}
+        if project_path not in self.openems_panels:
+            self.openems_panels[project_path] = OpenEMSDialog(self, project_path)
+        panel = self.openems_panels[project_path]
+        panel.show()
+        panel.raise_()
+        panel.activateWindow()
 
     def openProject(self):
         self.indexItem = self.treewidget.currentIndex()
