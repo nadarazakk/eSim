@@ -16,6 +16,7 @@ from frontEnd.OpenEMSTemplates import (
     HELICAL_ANTENNA,
     PIN_FEED_HORN,
     RECTANGULAR_WAVEGUIDE,
+    SPHERE_RCS,
     STRIPLINE_TRANSITION,
     TEMPLATES,
     build_model,
@@ -39,6 +40,7 @@ from frontEnd.OpenEMSTemplates import (
         (CONICAL_HORN, "angle", 25.0),
         (HELICAL_ANTENNA, "turns", 8),
         (CRLH_EXTRACTION, "top_gap", 5.5),
+        (SPHERE_RCS, "radius", 250.0),
     ],
 )
 def test_edit_generate_and_archive(tmp_path, template, parameter, value):
@@ -385,3 +387,23 @@ def test_crlh_cell_and_ports(top_gap, bottom_gap):
     probes = {probe.get("Name") for probe in props.findall("ProbeBox")}
     assert probes == {f"port_{kind}{port}{suffix}" for port in (1, 2)
                       for kind, suffixes in (("ut", "ABC"), ("it", "AB")) for suffix in suffixes}
+
+
+def test_sphere_recording_surface_is_outside_plane_wave_box():
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[SPHERE_RCS]}
+    model = build_model(SPHERE_RCS, dict(values, radius=450.0, angle=90.0))
+    props = model.find(".//Properties")
+    assert float(props.find("Metal//Sphere").get("Radius")) == 450
+    source = props.find("Excitation")
+    assert (source.get("Type"), source.get("Excite")) == ("10", "0,0,1")
+    assert list(map(float, source.get("PropDir").split(","))) == pytest.approx([0, 1, 0])
+    source_edge = float(source.find(".//P2").get("X"))
+    assert source_edge > 450
+    mesh = list(map(float, model.findtext(".//XLines").split(",")))
+    for field in "EH":
+        faces = props.findall(f"DumpBox[@Name='nf2ff_{field}']//Box")
+        assert len(faces) == 6
+        for face, axis in zip(faces, "XXYYZZ"):
+            plane = float(face.find("P1").get(axis))
+            assert plane == float(face.find("P2").get(axis))
+            assert source_edge < abs(plane) <= mesh[-10]

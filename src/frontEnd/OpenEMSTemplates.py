@@ -23,6 +23,7 @@ PIN_FEED_HORN = "Horn Antenna with Coaxial Pin Feed"
 CONICAL_HORN = "Conical Horn Antenna"
 HELICAL_ANTENNA = "Helical Antenna"
 CRLH_EXTRACTION = "CRLH Parameter Extraction"
+SPHERE_RCS = "Metal Sphere Radar Cross Section"
 HELIX_BANDWIDTH = 0.5  # GHz
 HORN_FEED_LENGTH = 50.0  # mm
 HORN_PIN_HALF_WIDTH = 0.5
@@ -152,6 +153,13 @@ TEMPLATES = {
         ("f_max", EXCITATION, "Upper band edge (GHz)", 6.0, 0.2, 12.0),
         ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
     ],
+    SPHERE_RCS: [
+        ("radius", GEOMETRY, "Sphere radius (mm)", 200.0, 75.0, 500.0),
+        ("angle", EXCITATION, "Plane-wave incidence angle from +X (degrees)", 0.0, -180.0, 180.0),
+        ("f_min", EXCITATION, "Lower band edge (MHz)", 50.0, 10.0, 1500.0),
+        ("f_max", EXCITATION, "Upper band edge (MHz)", 1000.0, 20.0, 1500.0),
+        ("steps", SIMULATION, "Maximum time steps", 10000, 1000, 100000),
+    ],
 }
 
 
@@ -171,8 +179,8 @@ def validate(template, values):
     if template == CRLH_EXTRACTION:
         if max(values["top_gap"], values["bottom_gap"]) >= values["length"]:
             raise ValueError("Both gaps must be smaller than the unit-cell length.")
-        if values["f_min"] >= values["f_max"]:
-            raise ValueError("The lower band edge must be below the upper band edge.")
+    if template in (CRLH_EXTRACTION, SPHERE_RCS) and values["f_min"] >= values["f_max"]:
+        raise ValueError("The lower band edge must be below the upper band edge.")
     if template in (PIN_FEED_HORN, CONICAL_HORN):
         reference = values["f_ref"]
         if values["f_min"] >= values["f_max"]:
@@ -809,6 +817,33 @@ def helical_antenna(props, p):
     return transverse, transverse, axial
 
 
+def sphere_rcs(props, p):
+    radius = p["radius"]
+    spacing = min(1000 * LIGHT_SPEED_MM_PER_NS / (20 * p["f_max"]), radius / 8)
+    source_edge = max(375, radius + 3 * spacing)
+    record_edge = max(600 - 9 * spacing, source_edge + 3 * spacing)
+    positive = grid_axis([0, source_edge, record_edge], spacing)
+    positive += series(record_edge, record_edge + 9 * spacing, 9)[1:]
+    axis = [-point for point in reversed(positive[1:])] + positive
+    metal = ET.SubElement(props, "Metal", Name="sphere")
+    sphere = ET.SubElement(ET.SubElement(metal, "Primitives"), "Sphere",
+                           Priority="10", Radius=str(radius))
+    ET.SubElement(sphere, "Center", X="0", Y="0", Z="0")
+
+    angle = math.radians(p["angle"])
+    # Use the tutorial's phase-velocity reference when it is in the band.
+    reference = 500 if p["f_min"] <= 500 <= p["f_max"] else (p["f_min"] + p["f_max"]) / 2
+    source = ET.SubElement(
+        props, "Excitation", Name="plane_wave", Type="10", Excite="0,0,1",
+        PropDir=f"{math.cos(angle)},{math.sin(angle)},0", Frequency=str(reference * 1e6),
+    )
+    box(source, [-source_edge] * 3, [source_edge] * 3)
+    # The solver writes the incident waveform to et. Record only scattered
+    # fields on the surface outside the total-field excitation box.
+    nf2ff_surface(props, [-record_edge] * 3, [record_edge] * 3)
+    return axis, axis, axis
+
+
 def build_model(template, values):
     validate(template, values)
     settings = json.dumps({"template": template, "values": values}, allow_nan=False)
@@ -846,8 +881,8 @@ def build_model(template, values):
         boundaries = ["PEC", "PML_8", "PEC", "PEC", "PEC", "PEC"]
         geometry = cylindrical_wave
     elif template in (RECTANGULAR_WAVEGUIDE, CIRCULAR_WAVEGUIDE, PIN_FEED_HORN,
-                       CONICAL_HORN, CRLH_EXTRACTION):
-        hz = 1e6 if circular else 1e9
+                       CONICAL_HORN, CRLH_EXTRACTION, SPHERE_RCS):
+        hz = 1e6 if template in (CIRCULAR_WAVEGUIDE, SPHERE_RCS) else 1e9
         ET.SubElement(
             fdtd, "Excitation", Type="0",
             f0=str((values["f_max"] + values["f_min"]) * 0.5 * hz),
@@ -860,6 +895,9 @@ def build_model(template, values):
         elif template == CRLH_EXTRACTION:
             boundaries = ["PML_8", "PML_8", "MUR", "MUR", "PEC", "PML_8"]
             geometry = crlh_extraction
+        elif template == SPHERE_RCS:
+            boundaries = ["PML_8"] * 6
+            geometry = sphere_rcs
         else:
             boundaries = ["PEC", "PEC", "PEC", "PEC", "PML_8", "PML_8"]
             geometry = circular_waveguide if circular else rectangular_waveguide
