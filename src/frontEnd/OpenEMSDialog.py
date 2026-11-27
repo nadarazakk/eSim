@@ -10,6 +10,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 
 from frontEnd.OpenEMSProject import ProjectRuns, write_json
+from frontEnd.OpenEMSSetup import OpenEMSSetup
 
 
 def find_openems():
@@ -63,6 +64,11 @@ class OpenEMSDialog(QtWidgets.QDialog):
         self.run.clicked.connect(self.start)
         self.stop.clicked.connect(self.stop_run)
         save.clicked.connect(self.save_log)
+        self.setup_button = None
+        if self.store:
+            self.setup_button = QtWidgets.QPushButton("Set up model…")
+            buttons.insertWidget(0, self.setup_button)
+            self.setup_button.clicked.connect(self.setup_model)
         self.set_running(False)
 
         if self.store:
@@ -90,6 +96,13 @@ class OpenEMSDialog(QtWidgets.QDialog):
             except (ValueError, OSError) as error:
                 self.model_label.setText(str(error))
             self.refresh_history()
+
+    def setup_model(self):
+        dialog = OpenEMSSetup(self, self.store, self.model)
+        if dialog.exec():
+            self.model = str(dialog.generated)
+            self.model_label.setText(self.model)
+            self.run.setEnabled(True)
 
     def refresh_history(self):
         self.history.clear()
@@ -178,6 +191,8 @@ class OpenEMSDialog(QtWidgets.QDialog):
             self.run.setEnabled(True)
 
     def set_running(self, running):
+        if self.setup_button is not None:
+            self.setup_button.setEnabled(not running)
         self.browse.setEnabled(not running)
         self.run.setEnabled(bool(self.model) and not running)
         self.stop.setEnabled(running)
