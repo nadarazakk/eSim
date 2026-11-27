@@ -1,20 +1,47 @@
 """Tabbed setup shared by the project-local openEMS templates."""
 
+import re
 from pathlib import Path
 from xml.etree.ElementTree import ParseError
 
-from PyQt6 import QtWidgets
+from PyQt6 import QtCore, QtWidgets
 
 from frontEnd.OpenEMSTemplates import (
+    BENT_PATCH,
+    CIRCULAR_WAVEGUIDE,
+    CONICAL_HORN,
+    CRLH_EXTRACTION,
+    CYLINDRICAL_WAVE,
+    DIPOLE_SAR,
     EXCITATION,
     GEOMETRY,
+    HELICAL_ANTENNA,
+    MRI_LOOP_COIL,
+    PATCH_ANTENNA,
+    PIN_FEED_HORN,
+    RECTANGULAR_WAVEGUIDE,
     SIMULATION,
+    SPHERE_RCS,
+    STRIPLINE_TRANSITION,
     TEMPLATES,
     UWB_CHANNELS,
     UWB_RADAR,
     read_setup,
     save_model,
 )
+
+
+TEMPLATE_CATEGORIES = {
+    "Transmission Lines and Filters": (
+        "Parallel Plate Waveguide", "Microstrip Notch Filter", STRIPLINE_TRANSITION,
+    ),
+    "Waveguides": (RECTANGULAR_WAVEGUIDE, CIRCULAR_WAVEGUIDE, CYLINDRICAL_WAVE),
+    "Patch Antennas": (PATCH_ANTENNA, BENT_PATCH),
+    "Horn and Wire Antennas": (PIN_FEED_HORN, CONICAL_HORN, HELICAL_ANTENNA),
+    "CRLH Structures": (CRLH_EXTRACTION,),
+    "Scattering and Radar": (SPHERE_RCS, UWB_RADAR),
+    "Biomedical and SAR": (DIPOLE_SAR, MRI_LOOP_COIL),
+}
 
 
 class OpenEMSSetup(QtWidgets.QDialog):
@@ -24,15 +51,17 @@ class OpenEMSSetup(QtWidgets.QDialog):
         self.store = store
         self.editing = None
         self.generated = None
+        self.suggested_name = ""
         self.inputs = {}
         layout = QtWidgets.QVBoxLayout(self)
         header = QtWidgets.QFormLayout()
         layout.addLayout(header)
+        self.category = QtWidgets.QComboBox()
+        self.category.addItems(TEMPLATE_CATEGORIES)
+        header.addRow("Category", self.category)
         self.template = QtWidgets.QComboBox()
-        self.template.addItems(TEMPLATES)
         header.addRow("Template", self.template)
         self.name = QtWidgets.QLineEdit()
-        self.name.setPlaceholderText("e.g. waveguide_01")
         header.addRow("Model name", self.name)
         self.tabs = QtWidgets.QTabWidget()
         layout.addWidget(self.tabs)
@@ -53,8 +82,10 @@ class OpenEMSSetup(QtWidgets.QDialog):
                     if saved:
                         self.editing = path
                         self.name.setText(path.stem)
-                        self.template.setCurrentText(saved[0])
-        self.populate()
+                        category = next(name for name, templates in TEMPLATE_CATEGORIES.items()
+                                        if saved[0] in templates)
+                        self.category.setCurrentText(category)
+        self.update_templates(saved[0] if self.editing else None)
         if self.editing:
             for key, widget in self.inputs.items():
                 value = saved[1][key]
@@ -65,9 +96,21 @@ class OpenEMSSetup(QtWidgets.QDialog):
             layout.insertWidget(
                 1, QtWidgets.QLabel("Change the model name to save a separate copy.")
             )
+        self.category.currentIndexChanged.connect(lambda: self.update_templates())
         self.template.currentTextChanged.connect(self.populate)
 
+    def update_templates(self, selected=None):
+        with QtCore.QSignalBlocker(self.template):
+            self.template.clear()
+            self.template.addItems(TEMPLATE_CATEGORIES[self.category.currentText()])
+            if selected is not None:
+                self.template.setCurrentText(selected)
+        self.populate()
+
     def populate(self):
+        if self.editing is None and self.name.text() == self.suggested_name:
+            self.suggested_name = self.next_model_name()
+            self.name.setText(self.suggested_name)
         while self.tabs.count():
             page = self.tabs.widget(0)
             self.tabs.removeTab(0)
@@ -99,6 +142,15 @@ class OpenEMSSetup(QtWidgets.QDialog):
                 form.addRow(label, widget)
                 self.inputs[key] = widget
             self.tabs.addTab(page, group)
+
+    def next_model_name(self):
+        title = f"{self.category.currentText()}-{self.template.currentText()}"
+        prefix = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+        models = self.store.folder / "models"
+        number = 1
+        while (models / f"{prefix}-{number:02d}.xml").exists():
+            number += 1
+        return f"{prefix}-{number:02d}"
 
     def save(self):
         values = {
