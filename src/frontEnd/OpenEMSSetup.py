@@ -10,6 +10,8 @@ from frontEnd.OpenEMSTemplates import (
     GEOMETRY,
     SIMULATION,
     TEMPLATES,
+    UWB_CHANNELS,
+    UWB_RADAR,
     read_setup,
     save_model,
 )
@@ -55,7 +57,11 @@ class OpenEMSSetup(QtWidgets.QDialog):
         self.populate()
         if self.editing:
             for key, widget in self.inputs.items():
-                widget.setValue(saved[1][key])
+                value = saved[1][key]
+                if isinstance(widget, QtWidgets.QComboBox):
+                    widget.setCurrentIndex(widget.findData(value))
+                else:
+                    widget.setValue(value)
             layout.insertWidget(
                 1, QtWidgets.QLabel("Change the model name to save a separate copy.")
             )
@@ -74,6 +80,14 @@ class OpenEMSSetup(QtWidgets.QDialog):
             for key, tab, label, default, minimum, maximum in fields:
                 if tab != group:
                     continue
+                if self.template.currentText() == UWB_RADAR and key == "channel":
+                    widget = QtWidgets.QComboBox()
+                    for channel in UWB_CHANNELS:
+                        widget.addItem(str(channel), channel)
+                    widget.setCurrentIndex(widget.findData(default))
+                    form.addRow(label, widget)
+                    self.inputs[key] = widget
+                    continue
                 if isinstance(default, int):
                     widget = QtWidgets.QSpinBox()
                 else:
@@ -87,7 +101,10 @@ class OpenEMSSetup(QtWidgets.QDialog):
             self.tabs.addTab(page, group)
 
     def save(self):
-        values = {key: widget.value() for key, widget in self.inputs.items()}
+        values = {
+            key: widget.currentData() if isinstance(widget, QtWidgets.QComboBox) else widget.value()
+            for key, widget in self.inputs.items()
+        }
         try:
             self.generated = save_model(
                 self.store,
