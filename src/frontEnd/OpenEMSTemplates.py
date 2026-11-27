@@ -12,6 +12,8 @@ GEOMETRY = "Geometry & Materials"
 EXCITATION = "Excitation & Ports"
 SIMULATION = "Simulation Settings"
 PATCH_ANTENNA = "Simple Patch Antenna"
+RECTANGULAR_WAVEGUIDE = "Rectangular Waveguide"
+LIGHT_SPEED_MM_PER_NS = 299.792458
 
 # key, tab, label with unit, default, minimum, maximum
 TEMPLATES = {
@@ -44,6 +46,16 @@ TEMPLATES = {
         ("cutoff", EXCITATION, "Gaussian 20 dB bandwidth (±GHz)", 1.0, 0.1, 3.0),
         ("steps", SIMULATION, "Maximum time steps", 30000, 1000, 200000),
     ],
+    RECTANGULAR_WAVEGUIDE: [
+        ("width", GEOMETRY, "Waveguide width in X (mm)", 10.7, 2.0, 40.0),
+        ("height", GEOMETRY, "Waveguide height in Y (mm)", 4.3, 1.0, 30.0),
+        ("length", GEOMETRY, "Waveguide length in Z (mm)", 50.0, 5.0, 200.0),
+        ("m", EXCITATION, "TE mode index m (X)", 1, 0, 9),
+        ("n", EXCITATION, "TE mode index n (Y)", 0, 0, 9),
+        ("f_min", EXCITATION, "Lower band edge (GHz)", 20.0, 1.0, 50.0),
+        ("f_max", EXCITATION, "Upper band edge (GHz)", 26.0, 1.0, 50.0),
+        ("steps", SIMULATION, "Maximum time steps", 10000, 1000, 200000),
+    ],
 }
 
 
@@ -71,6 +83,17 @@ def validate(template, values):
             raise ValueError("The feed must be inside the patch.")
         if values["cutoff"] > values["frequency"]:
             raise ValueError("Gaussian bandwidth must not exceed the center frequency.")
+    if template == RECTANGULAR_WAVEGUIDE:
+        m, n = values["m"], values["n"]
+        if m == n == 0:
+            raise ValueError("A TE mode needs at least one nonzero index.")
+        if values["f_min"] >= values["f_max"]:
+            raise ValueError("The lower band edge must be below the upper band edge.")
+        cutoff = LIGHT_SPEED_MM_PER_NS / 2 * math.hypot(m / values["width"], n / values["height"])
+        if values["f_min"] <= cutoff:
+            raise ValueError(
+                f"The lower band edge must exceed the TE{m}{n} cutoff ({cutoff:.3f} GHz)."
+            )
 
 
 def series(start, stop, cells):
@@ -108,6 +131,37 @@ def waveguide(props, p):
     dump = ET.SubElement(props, "DumpBox", Name="Et", DumpType="0", DumpMode="1", FileType="0")
     box(dump, [-10, 0, start], [10, 0, end])
     return axes
+
+
+def rectangular_waveguide(props, p):
+    width, height, length = p["width"], p["height"], p["length"]
+    spacing = LIGHT_SPEED_MM_PER_NS / (20 * p["f_max"])
+    x = series(0, width, max(4, math.ceil(width / spacing)))
+    y = series(0, height, max(4, math.ceil(height / spacing)))
+    # Leave room for eight PML cells at each end, the source, and two probe planes.
+    z = series(0, length, max(32, math.ceil(length / spacing)))
+
+    # Transverse field profiles for TE(m,n) propagating along +Z, in mesh units.
+    mx, ny = p["m"] / width, p["n"] / height
+    kx, ky = math.pi * mx, math.pi * ny
+    hx = f"{mx}*sin({kx}*x)*cos({ky}*y)"
+    hy = f"{ny}*cos({kx}*x)*sin({ky}*y)"
+    electric = {"X": hy, "Y": f"-{hx}", "Z": "0"}
+    magnetic = {"X": hx, "Y": hy, "Z": "0"}
+    source = ET.SubElement(props, "Excitation", Name="port_excite_1", Type="0", Excite="1,1,0")
+    ET.SubElement(source, "Weight", electric)
+    box(source, [0, 0, z[10]], [width, height, z[10]])
+    for port, plane, direction in ((1, z[14], 1), (2, z[-15], -1)):
+        for prefix, kind, profile, weight in (
+            ("port_ut", "10", electric, 1),
+            ("port_it", "11", magnetic, direction),
+        ):
+            probe = ET.SubElement(
+                props, "ProbeBox", Name=f"{prefix}{port}", Type=kind, Weight=str(weight)
+            )
+            ET.SubElement(probe, "ModeFunction", profile)
+            box(probe, [0, 0, plane], [width, height, plane])
+    return x, y, z
 
 
 def notch_filter(props, p):
@@ -238,6 +292,14 @@ def build_model(template, values):
         )
         boundaries = ["MUR"] * 6
         geometry = patch_antenna
+    elif template == RECTANGULAR_WAVEGUIDE:
+        ET.SubElement(
+            fdtd, "Excitation", Type="0",
+            f0=str((values["f_max"] + values["f_min"]) * 0.5e9),
+            fc=str((values["f_max"] - values["f_min"]) * 0.5e9),
+        )
+        boundaries = ["PEC", "PEC", "PEC", "PEC", "PML_8", "PML_8"]
+        geometry = rectangular_waveguide
     else:
         center = str(values["frequency"] * 0.5e9)
         ET.SubElement(fdtd, "Excitation", Type="0", f0=center, fc=center)
