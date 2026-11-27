@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from frontEnd.OpenEMSProject import ProjectRuns
 from frontEnd.OpenEMSTemplates import (
     CIRCULAR_WAVEGUIDE,
+    CYLINDRICAL_WAVE,
     RECTANGULAR_WAVEGUIDE,
     TEMPLATES,
     build_model,
@@ -25,6 +26,7 @@ from frontEnd.OpenEMSTemplates import (
         ("Simple Patch Antenna", "width"),
         (RECTANGULAR_WAVEGUIDE, "length"),
         (CIRCULAR_WAVEGUIDE, "radial_spacing"),
+        (CYLINDRICAL_WAVE, "resolution"),
     ],
 )
 def test_edit_generate_and_archive(tmp_path, template, parameter):
@@ -125,3 +127,53 @@ def test_invalid_circular_waveguide(changes):
     values = {key: default for key, _, _, default, _, _ in TEMPLATES[CIRCULAR_WAVEGUIDE]}
     with pytest.raises(ValueError):
         build_model(CIRCULAR_WAVEGUIDE, {**values, **changes})
+
+
+def test_cylindrical_wave_mesh_source_and_field_dumps():
+    values = dict(
+        radius=2400.0, resolution=12.0, frequency=0.85, offset=777.125, angle=-79.123, steps=50000
+    )
+    model = build_model(CYLINDRICAL_WAVE, values)
+    fdtd = model.find("FDTD")
+    assert fdtd.get("CylinderCoords") == "1"
+    assert list(map(float, fdtd.get("MultiGrid").split(","))) == [75, 150, 300, 600, 1200]
+    assert fdtd.find("BoundaryCond").get("xmax") == "PML_8"
+    pulse = fdtd.find("Excitation")
+    assert pulse.get("Type") == "0"
+    assert (float(pulse.get("f0")), float(pulse.get("fc"))) == (850e6, 425e6)
+    grid = model.find(".//RectilinearGrid")
+    assert grid.get("CoordSystem") == "1"
+    radial, azimuths, z = [
+        list(map(float, grid.findtext(axis + "Lines").split(","))) for axis in "XYZ"
+    ]
+    assert radial[0] == 0 and radial[-1] == values["radius"]
+    assert max(b - a for a, b in zip(radial, radial[1:])) <= values["resolution"] + 1e-10
+    assert len(azimuths) == 1601 and azimuths[-1] - azimuths[0] == pytest.approx(math.tau)
+    assert z == [-24, -12, 0, 12, 24]
+    source = model.find(".//Properties/Excitation")
+    assert source.get("Type") == "1" and source.get("Excite") == "0,0,1"
+    start, stop = source.find(".//Box")
+    assert float(start.get("X")) == float(stop.get("X")) == values["offset"]
+    assert values["offset"] in radial
+    angle = math.radians(values["angle"])
+    assert float(start.get("Y")) < angle < float(stop.get("Y"))
+    assert azimuths[800] == pytest.approx(angle)
+    assert (float(start.get("Z")), float(stop.get("Z"))) == (z[0], z[-1])
+
+    for name, dump_type, file_type in (("Et_ra", "0", "0"), ("Ef_ra", "10", "1")):
+        dump = model.find(f".//DumpBox[@Name='{name}']")
+        assert (dump.get("DumpType"), dump.get("FileType")) == (dump_type, file_type)
+        start, stop = dump.find(".//Box")
+        assert [float(start.get(k)) for k in "XYZ"] == [0, azimuths[0], 0]
+        assert [float(stop.get(k)) for k in "XYZ"] == [radial[-9], azimuths[-1], 0]
+    assert float(model.findtext(".//DumpBox[@Name='Ef_ra']/FD_Samples")) == 850e6
+
+
+@pytest.mark.parametrize("changes", [
+    {"offset": 2500},
+    {"radius": 320, "resolution": 20, "offset": 100},
+])
+def test_invalid_cylindrical_wave(changes):
+    values = {key: default for key, _, _, default, _, _ in TEMPLATES[CYLINDRICAL_WAVE]}
+    with pytest.raises(ValueError):
+        build_model(CYLINDRICAL_WAVE, {**values, **changes})

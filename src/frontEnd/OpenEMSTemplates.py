@@ -14,6 +14,8 @@ SIMULATION = "Simulation Settings"
 PATCH_ANTENNA = "Simple Patch Antenna"
 RECTANGULAR_WAVEGUIDE = "Rectangular Waveguide"
 CIRCULAR_WAVEGUIDE = "Circular Waveguide"
+CYLINDRICAL_WAVE = "2D Cylindrical Wave"
+RADIAL_SPLIT_DIVISORS = (32, 16, 8, 4, 2)
 LIGHT_SPEED_MM_PER_NS = 299.792458
 TE11_ROOT = 1.84118378134  # First positive zero of the derivative of J1.
 
@@ -68,6 +70,14 @@ TEMPLATES = {
         ("axial_spacing", SIMULATION, "Maximum axial cell size (mm)", 10.0, 5.0, 50.0),
         ("steps", SIMULATION, "Maximum time steps", 60000, 1000, 200000),
     ],
+    CYLINDRICAL_WAVE: [
+        ("radius", GEOMETRY, "Domain radius (mm)", 2560.0, 320.0, 5120.0),
+        ("frequency", EXCITATION, "Gaussian center frequency (GHz)", 1.0, 0.1, 3.0),
+        ("offset", EXCITATION, "Source radial offset (mm)", 1300.0, 0.0, 5120.0),
+        ("angle", EXCITATION, "Source azimuth (degrees)", 45.0, -180.0, 180.0),
+        ("resolution", SIMULATION, "Radial and axial mesh spacing (mm)", 10.0, 5.0, 40.0),
+        ("steps", SIMULATION, "Maximum time steps", 100000, 1000, 200000),
+    ],
 }
 
 
@@ -111,6 +121,13 @@ def validate(template, values):
         cutoff = 1000 * LIGHT_SPEED_MM_PER_NS * TE11_ROOT / (math.tau * values["radius"])
         if values["f_min"] <= cutoff:
             raise ValueError(f"The lower band edge must exceed the TE11 cutoff ({cutoff:.3f} MHz).")
+    if template == CYLINDRICAL_WAVE:
+        if values["radius"] / RADIAL_SPLIT_DIVISORS[0] < 4 * values["resolution"]:
+            raise ValueError(
+                "Reduce the mesh spacing to fit four radial cells in the innermost subgrid."
+            )
+        if values["offset"] >= values["radius"] - 8 * values["resolution"]:
+            raise ValueError("Place the source inside the domain, before the eight absorbing cells.")
 
 
 def series(start, stop, cells):
@@ -201,6 +218,32 @@ def waveguide_ports(props, cross_section, z, electric, magnetic):
             )
             ET.SubElement(probe, "ModeFunction", profile)
             box(probe, [0, 0, plane], [*cross_section, plane])
+
+
+def cylindrical_wave(props, p):
+    radius, spacing, offset = p["radius"], p["resolution"], p["offset"]
+    # Put the source on a radial line and an azimuth shared by all five subgrids.
+    radial = grid_axis([0, offset, radius], spacing)
+    azimuth = math.radians(p["angle"])
+    angular = series(azimuth - math.pi, azimuth + math.pi, 50 * 2**len(RADIAL_SPLIT_DIVISORS))
+    z = series(-2 * spacing, 2 * spacing, 4)
+    source = ET.SubElement(props, "Excitation", Name="excite", Type="1", Excite="0,0,1")
+    # openEMS uses the first angular line for the axial E field at r=0.
+    source_angle = angular[0] if offset == 0 else azimuth
+    box(source, [offset, source_angle - 0.001, z[0]], [offset, source_angle + 0.001, z[-1]])
+
+    # Sample the midplane up to the inner edge of the outer radial PML.
+    start, stop = [0, angular[0], 0], [radial[-9], angular[-1], 0]
+    et = ET.SubElement(
+        props, "DumpBox", Name="Et_ra", DumpType="0", FileType="0", SubSampling="4,10,1"
+    )
+    box(et, start, stop)
+    ef = ET.SubElement(
+        props, "DumpBox", Name="Ef_ra", DumpType="10", FileType="1", SubSampling="2,2,2"
+    )
+    ET.SubElement(ef, "FD_Samples").text = str(p["frequency"] * 1e9)
+    box(ef, start, stop)
+    return radial, angular, z
 
 
 def notch_filter(props, p):
@@ -332,6 +375,12 @@ def build_model(template, values):
         )
         boundaries = ["MUR"] * 6
         geometry = patch_antenna
+    elif template == CYLINDRICAL_WAVE:
+        f0 = values["frequency"] * 1e9
+        ET.SubElement(fdtd, "Excitation", Type="0", f0=str(f0), fc=str(f0 / 2))
+        fdtd.set("MultiGrid", ",".join(str(values["radius"] / d) for d in RADIAL_SPLIT_DIVISORS))
+        boundaries = ["PEC", "PML_8", "PEC", "PEC", "PEC", "PEC"]
+        geometry = cylindrical_wave
     elif template in (RECTANGULAR_WAVEGUIDE, CIRCULAR_WAVEGUIDE):
         hz = 1e6 if circular else 1e9
         ET.SubElement(
@@ -353,7 +402,7 @@ def build_model(template, values):
     )
     csx = ET.SubElement(root, "ContinuousStructure", CoordSystem="0")
     grid = ET.SubElement(csx, "RectilinearGrid", DeltaUnit="1" if plate else "0.001")
-    if circular:
+    if circular or template == CYLINDRICAL_WAVE:
         fdtd.set("CylinderCoords", "1")
         fdtd.set("endCriteria", "1e-4")
         csx.set("CoordSystem", "1")
